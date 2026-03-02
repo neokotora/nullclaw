@@ -315,6 +315,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
+    const is_static = b.option(bool, "static", "Static build") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.1";
     const channels_raw = b.option(
         []const u8,
@@ -454,15 +455,23 @@ pub fn build(b: *std.Build) void {
     else
         &.{.{ .name = "nullclaw", .module = lib_mod.? }};
 
-    const exe = b.addExecutable(.{
-        .name = "nullclaw",
-        .root_module = b.createModule(.{
-            .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = exe_imports,
-        }),
+    const exe_root_module = b.createModule(.{
+        .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = exe_imports,
     });
+    const exe = if (is_static)
+        b.addExecutable(.{
+            .name = "nullclaw",
+            .root_module = exe_root_module,
+            .linkage = .static,
+        })
+    else
+        b.addExecutable(.{
+            .name = "nullclaw",
+            .root_module = exe_root_module,
+        });
     exe.root_module.addImport("build_options", build_options_module);
 
     // Link SQLite on the compile step (not the module)

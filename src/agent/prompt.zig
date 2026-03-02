@@ -235,6 +235,48 @@ pub fn buildSystemPrompt(
     try w.writeAll("- When in doubt, ask before acting externally.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
 
+    // Group chat behavior section (Telegram-only for now).
+    // The [NO_REPLY] marker is currently suppressed only by the Telegram loop.
+    if (ctx.conversation_context) |cc| {
+        const is_telegram = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "telegram") else false;
+        if (is_telegram and cc.is_group != null and cc.is_group.?) {
+            try w.writeAll("## Group Chat Behavior\n\n");
+            try w.writeAll("You are in a group chat. Not every message requires a response.\n\n");
+            try w.writeAll("Use the `[NO_REPLY]` marker when:\n");
+            try w.writeAll("- The message is casual chat between other members\n");
+            try w.writeAll("- The message is not directed at you (no question, no @mention)\n");
+            try w.writeAll("- The message is a simple acknowledgment (ok, thanks, haha, etc.)\n");
+            try w.writeAll("- You have nothing meaningful to add to the conversation\n\n");
+            try w.writeAll("When you choose NOT to reply, include `[NO_REPLY]` anywhere in your response. The system will suppress the message.\n\n");
+            try w.writeAll("Examples of when to use `[NO_REPLY]`:\n");
+            try w.writeAll("- \"Anyone online?\" -> `[NO_REPLY]` (unless you're specifically needed)\n");
+            try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");
+            try w.writeAll("- General chit-chat between other members -> `[NO_REPLY]`\n\n");
+
+            // Add schedule tool guidance for Telegram group chats.
+            try w.writeAll("## Scheduled Tasks in Groups\n\n");
+            try w.writeAll("When using the `schedule` tool to create reminders in this group:\n");
+            try w.writeAll("1. Use SIMPLE command like: `echo \"Time is up!\"` or `date`\n");
+            try w.writeAll("2. ALWAYS use double quotes (\") for the command string, not single quotes\n");
+            try w.writeAll("3. The system will AUTOMATICALLY send the result to this group\n");
+            try w.writeAll("4. DO NOT use curl, say, or other methods to send messages manually\n");
+            try w.writeAll("5. DO NOT add any extra commands - just the basic echo\n\n");
+            if (cc.group_id) |gid| {
+                try std.fmt.format(w, "Current group ID: `{s}`\n\n", .{gid});
+            }
+            try w.writeAll("Good example (simple, double quotes):\n");
+            try w.writeAll("```\nschedule action=once delay=30m command=\"echo \\\"Time is up!\\\"\"\n```\n\n");
+            try w.writeAll("The command output will be automatically delivered to this chat.\n\n");
+        }
+    }
+
+    // Schedule tool guidance for all contexts (including private chats)
+    try w.writeAll("## Scheduled Tasks\n\n");
+    try w.writeAll("When using the `schedule` tool to create reminders:\n");
+    try w.writeAll("- ALWAYS use double quotes (\") for the command string\n");
+    try w.writeAll("- Example: `echo \"Time is up!\"`\n");
+    try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
+
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir);
 
@@ -677,6 +719,42 @@ test "buildSystemPrompt includes channel attachment marker guidance" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not claim attachment sending is unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Choices") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<nc_choices>") != null);
+}
+
+test "buildSystemPrompt omits telegram-only group marker guidance for non-telegram groups" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "signal",
+            .is_group = true,
+            .group_id = "group-1",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Group Chat Behavior") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[NO_REPLY]") == null);
+}
+
+test "buildSystemPrompt includes telegram group marker guidance for telegram groups" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "telegram",
+            .is_group = true,
+            .group_id = "-100123",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Group Chat Behavior") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[NO_REPLY]") != null);
 }
 
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {

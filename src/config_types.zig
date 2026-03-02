@@ -41,6 +41,9 @@ pub const ProviderEntry = struct {
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// Set to false to use XML tool format via system prompt instead.
     native_tools: bool = true,
+    /// Optional User-Agent header for HTTP requests to this provider.
+    /// When set, requests will include "User-Agent: {value}" header.
+    user_agent: ?[]const u8 = null,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────
@@ -187,6 +190,8 @@ pub const TelegramConfig = struct {
     /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
     proxy: ?[]const u8 = null,
     interactive: TelegramInteractiveConfig = .{},
+    /// When true, only respond to messages that @mention the bot (in groups).
+    require_mention: bool = false,
 };
 
 pub const DiscordConfig = struct {
@@ -1212,6 +1217,10 @@ pub const SessionConfig = struct {
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
     typing_interval_secs: u32 = 5,
+    /// Maximum concurrent message processing tasks per channel.
+    /// When set to 0 or 1, messages are processed sequentially.
+    /// Higher values enable parallel processing across different sessions.
+    max_concurrent_tasks: u32 = 4,
 };
 
 test "WebConfig defaults" {

@@ -266,6 +266,19 @@ fn upsertSchedulerRuntimeJob(
         dst.last_status = runtime_job.last_status;
         dst.paused = runtime_job.paused;
         dst.one_shot = runtime_job.one_shot;
+        // Update delivery config
+        dst.delivery.mode = runtime_job.delivery.mode;
+        if (dst.delivery.channel_owned) {
+            if (dst.delivery.channel) |c| allocator.free(c);
+        }
+        dst.delivery.channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null;
+        dst.delivery.channel_owned = runtime_job.delivery.channel != null;
+        if (dst.delivery.to_owned) {
+            if (dst.delivery.to) |t| allocator.free(t);
+        }
+        dst.delivery.to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null;
+        dst.delivery.to_owned = runtime_job.delivery.to != null;
+        dst.delivery.best_effort = runtime_job.delivery.best_effort;
         return;
     }
 
@@ -286,6 +299,14 @@ fn upsertSchedulerRuntimeJob(
         .enabled = runtime_job.enabled,
         .delete_after_run = runtime_job.delete_after_run,
         .created_at_s = runtime_job.created_at_s,
+        .delivery = .{
+            .mode = runtime_job.delivery.mode,
+            .channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null,
+            .to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null,
+            .best_effort = runtime_job.delivery.best_effort,
+            .channel_owned = runtime_job.delivery.channel != null,
+            .to_owned = runtime_job.delivery.to != null,
+        },
     });
 }
 

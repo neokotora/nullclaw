@@ -1,8 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+const urlEncode = @import("web_search_providers/common.zig").urlEncode;
+const http_util = @import("../http_util.zig");
 
 const PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json";
 
@@ -11,7 +14,6 @@ const PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json";
 /// PUSHOVER_USER_KEY in the workspace .env file.
 pub const PushoverTool = struct {
     workspace_dir: []const u8,
-    allocator: std.mem.Allocator,
 
     pub const tool_name = "pushover";
     pub const tool_description = "Send a push notification via Pushover. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.";
@@ -52,21 +54,26 @@ pub const PushoverTool = struct {
         defer allocator.free(creds.token);
         defer allocator.free(creds.user_key);
 
-        // Build form body
+        // Build form body with percent-encoded values
         var body_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer body_buf.deinit(allocator);
 
-        // Base fields
+        // Base fields (token and user_key are hex strings — safe to append raw)
         try body_buf.appendSlice(allocator, "token=");
         try body_buf.appendSlice(allocator, creds.token);
         try body_buf.appendSlice(allocator, "&user=");
         try body_buf.appendSlice(allocator, creds.user_key);
+
+        const encoded_message = try urlEncode(allocator, message);
+        defer allocator.free(encoded_message);
         try body_buf.appendSlice(allocator, "&message=");
-        try body_buf.appendSlice(allocator, message);
+        try body_buf.appendSlice(allocator, encoded_message);
 
         if (title) |t| {
+            const encoded_title = try urlEncode(allocator, t);
+            defer allocator.free(encoded_title);
             try body_buf.appendSlice(allocator, "&title=");
-            try body_buf.appendSlice(allocator, t);
+            try body_buf.appendSlice(allocator, encoded_title);
         }
 
         if (priority) |p| {
@@ -76,24 +83,21 @@ pub const PushoverTool = struct {
         }
 
         if (sound) |s| {
+            const encoded_sound = try urlEncode(allocator, s);
+            defer allocator.free(encoded_sound);
             try body_buf.appendSlice(allocator, "&sound=");
-            try body_buf.appendSlice(allocator, s);
+            try body_buf.appendSlice(allocator, encoded_sound);
         }
 
-        // Send via curl
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{
-                "curl", "-s",           "-X",             "POST",
-                "-d",   body_buf.items, PUSHOVER_API_URL,
-            },
-        }) catch
+        // Send via http_util form POST (pipes body via stdin to avoid argv length limits).
+        // Skipped in tests to avoid real network calls (AGENTS.md §3.6).
+        if (builtin.is_test) return ToolResult.ok("Notification sent successfully");
+        const response = http_util.curlPostForm(allocator, PUSHOVER_API_URL, body_buf.items) catch
             return ToolResult.fail("Failed to send Pushover request via curl");
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
+        defer allocator.free(response);
 
         // Check for {"status":1} in response
-        if (std.mem.indexOf(u8, result.stdout, "\"status\":1") != null) {
+        if (std.mem.indexOf(u8, response, "\"status\":1") != null) {
             return ToolResult.ok("Notification sent successfully");
         }
 
@@ -102,7 +106,7 @@ pub const PushoverTool = struct {
     }
 
     /// Parse a raw .env value: strip whitespace, quotes, export prefix, inline comments.
-    pub fn parseEnvValue(raw: []const u8) []const u8 {
+    fn parseEnvValue(raw: []const u8) []const u8 {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len == 0) return trimmed;
 
@@ -131,8 +135,11 @@ pub const PushoverTool = struct {
             return error.EnvFileNotFound;
         defer allocator.free(content);
 
-        var token: ?[]const u8 = null;
-        var user_key: ?[]const u8 = null;
+        var token: ?[]u8 = null;
+        var user_key: ?[]u8 = null;
+        // Free any partially allocated values on error exit
+        errdefer if (token) |t| allocator.free(t);
+        errdefer if (user_key) |u| allocator.free(u);
 
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |raw_line| {
@@ -149,20 +156,22 @@ pub const PushoverTool = struct {
                 const value = parseEnvValue(line[eq_pos + 1 ..]);
 
                 if (std.mem.eql(u8, key, "PUSHOVER_TOKEN")) {
-                    if (token) |old| allocator.free(old);
+                    // Null before free so errdefer does not double-free on OOM in dupe.
+                    const old = token;
+                    token = null;
+                    if (old) |o| allocator.free(o);
                     token = try allocator.dupe(u8, value);
                 } else if (std.mem.eql(u8, key, "PUSHOVER_USER_KEY")) {
-                    if (user_key) |old| allocator.free(old);
+                    const old = user_key;
+                    user_key = null;
+                    if (old) |o| allocator.free(o);
                     user_key = try allocator.dupe(u8, value);
                 }
             }
         }
 
         const t = token orelse return error.MissingPushoverToken;
-        const u = user_key orelse {
-            allocator.free(t);
-            return error.MissingPushoverUserKey;
-        };
+        const u = user_key orelse return error.MissingPushoverUserKey;
 
         return .{ .token = t, .user_key = u };
     }
@@ -171,13 +180,13 @@ pub const PushoverTool = struct {
 // ── Tests ───────────────────────────────────────────────────────────
 
 test "pushover tool name" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp" };
     const t = pt.tool();
     try std.testing.expectEqualStrings("pushover", t.name());
 }
 
 test "pushover schema has message required" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp" };
     const t = pt.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"message\"") != null);
@@ -185,7 +194,7 @@ test "pushover schema has message required" {
 }
 
 test "pushover execute missing message" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{}");
     defer parsed.deinit();
@@ -195,7 +204,7 @@ test "pushover execute missing message" {
 }
 
 test "pushover execute empty message" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"\"}");
     defer parsed.deinit();
@@ -205,7 +214,7 @@ test "pushover execute empty message" {
 }
 
 test "pushover priority -3 rejected" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": -3}");
     defer parsed.deinit();
@@ -216,7 +225,7 @@ test "pushover priority -3 rejected" {
 }
 
 test "pushover priority 5 rejected" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": 5}");
     defer parsed.deinit();
@@ -227,7 +236,7 @@ test "pushover priority 5 rejected" {
 }
 
 test "pushover priority 2 accepted (credential error expected)" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": 2}");
     defer parsed.deinit();
@@ -239,7 +248,7 @@ test "pushover priority 2 accepted (credential error expected)" {
 }
 
 test "pushover priority -2 accepted (credential error expected)" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir" };
     const t = pt.tool();
     const parsed = try root.parseTestArgs("{\"message\": \"hello\", \"priority\": -2}");
     defer parsed.deinit();
@@ -270,9 +279,81 @@ test "parseEnvValue strips inline comment" {
 }
 
 test "pushover schema has priority and sound" {
-    var pt = PushoverTool{ .workspace_dir = "/tmp", .allocator = std.testing.allocator };
+    var pt = PushoverTool{ .workspace_dir = "/tmp" };
     const t = pt.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "priority") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "sound") != null);
+}
+
+test "getCredentials reads token and user_key from .env file" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+        \\PUSHOVER_TOKEN=test-token-abc
+        \\PUSHOVER_USER_KEY=test-user-key-xyz
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
+    const creds = try pt.getCredentials(std.testing.allocator);
+    defer std.testing.allocator.free(creds.token);
+    defer std.testing.allocator.free(creds.user_key);
+
+    try std.testing.expectEqualStrings("test-token-abc", creds.token);
+    try std.testing.expectEqualStrings("test-user-key-xyz", creds.user_key);
+}
+
+test "getCredentials reads exported and quoted values" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+        \\export PUSHOVER_TOKEN="quoted-token"
+        \\export PUSHOVER_USER_KEY='single-quoted-key'
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
+    const creds = try pt.getCredentials(std.testing.allocator);
+    defer std.testing.allocator.free(creds.token);
+    defer std.testing.allocator.free(creds.user_key);
+
+    try std.testing.expectEqualStrings("quoted-token", creds.token);
+    try std.testing.expectEqualStrings("single-quoted-key", creds.user_key);
+}
+
+test "getCredentials missing token returns error" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_USER_KEY=only-user-key\n" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
+    const result = pt.getCredentials(std.testing.allocator);
+    try std.testing.expectError(error.MissingPushoverToken, result);
+}
+
+test "getCredentials missing user_key returns error" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_TOKEN=only-token\n" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    var pt = PushoverTool{ .workspace_dir = abs_path };
+    const result = pt.getCredentials(std.testing.allocator);
+    try std.testing.expectError(error.MissingPushoverUserKey, result);
+}
+
+test "getCredentials missing .env returns error" {
+    var pt = PushoverTool{ .workspace_dir = "/tmp/nonexistent_pushover_test_dir_xyz" };
+    const result = pt.getCredentials(std.testing.allocator);
+    try std.testing.expectError(error.EnvFileNotFound, result);
 }

@@ -368,15 +368,15 @@ pub const GeminiProvider = struct {
         // 2. Environment variables (only if no explicit key)
         if (auth == null) {
             if (loadNonEmptyEnv(allocator, "GEMINI_API_KEY")) |value| {
-                allocator.free(value);
-                auth = .{ .env_gemini_key = "env" };
+                auth = .{ .env_gemini_key = value };
+                // Note: value is NOT freed — ownership transfers to auth
             }
         }
 
         if (auth == null) {
             if (loadNonEmptyEnv(allocator, "GOOGLE_API_KEY")) |value| {
-                allocator.free(value);
-                auth = .{ .env_google_key = "env" };
+                auth = .{ .env_google_key = value };
+                // Note: value is NOT freed — ownership transfers to auth
             }
         }
 
@@ -851,6 +851,8 @@ pub const GeminiProvider = struct {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
         if (self.auth) |auth| {
             switch (auth) {
+                .env_gemini_key => |key| self.allocator.free(key),
+                .env_google_key => |key| self.allocator.free(key),
                 .env_oauth_token => |tok| self.allocator.free(tok),
                 .oauth_token => |tok| self.allocator.free(tok),
                 else => {},
@@ -991,6 +993,8 @@ fn buildChatRequestBody(
 test "provider creates without key" {
     const p = GeminiProvider.init(std.testing.allocator, null);
     defer if (p.auth) |a| switch (a) {
+        .env_gemini_key => |key| std.testing.allocator.free(key),
+        .env_google_key => |key| std.testing.allocator.free(key),
         .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},
@@ -1007,6 +1011,8 @@ test "provider creates with key" {
 test "provider rejects empty key" {
     const p = GeminiProvider.init(std.testing.allocator, "");
     defer if (p.auth) |a| switch (a) {
+        .env_gemini_key => |key| std.testing.allocator.free(key),
+        .env_google_key => |key| std.testing.allocator.free(key),
         .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},
@@ -1134,6 +1140,8 @@ test "parseResponse multiple parts returns first text" {
 test "provider rejects whitespace key" {
     const p = GeminiProvider.init(std.testing.allocator, "   ");
     defer if (p.auth) |a| switch (a) {
+        .env_gemini_key => |key| std.testing.allocator.free(key),
+        .env_google_key => |key| std.testing.allocator.free(key),
         .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},

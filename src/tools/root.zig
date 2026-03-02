@@ -364,6 +364,11 @@ pub fn allTools(
     try list.append(allocator, sp.tool());
 
     if (opts.http_enabled) {
+        // Pushover notification tool (network egress, gated with HTTP tools).
+        const pt = try allocator.create(pushover.PushoverTool);
+        pt.* = .{ .workspace_dir = workspace_dir };
+        try list.append(allocator, pt.tool());
+
         const ht = try allocator.create(http_request.HttpRequestTool);
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
@@ -677,9 +682,9 @@ test "all tools includes extras when enabled" {
 
     // Order: shell, file_read, file_write, file_edit, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn, http_request, web_search, web_fetch,
-    //        browser = 17
-    try std.testing.expectEqual(@as(usize, 17), tools.len);
+    //        delegate, schedule, spawn, pushover, http_request, web_search,
+    //        web_fetch, browser = 18
+    try std.testing.expectEqual(@as(usize, 18), tools.len);
 }
 
 test "all tools excludes extras when disabled" {

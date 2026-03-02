@@ -548,7 +548,7 @@ pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![
 
 /// Create a fresh Config backed by an arena (for when Config.load() fails).
 /// Caller must call cfg.deinit() when done.
-fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
+pub fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
     const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
     arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
     errdefer {
@@ -772,9 +772,9 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
     return num - 1;
 }
 
-const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
-const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
-const wizard_memory_backend_order = [_][]const u8{
+pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
+pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+pub const wizard_memory_backend_order = [_][]const u8{
     "sqlite",
     "markdown",
     "memory",
@@ -800,7 +800,7 @@ fn selectableBackendsForWizard(allocator: std.mem.Allocator) ![]const *const mem
     return out.toOwnedSlice(allocator);
 }
 
-fn memoryProfileForBackend(backend: []const u8) []const u8 {
+pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
     if (std.mem.eql(u8, backend, "sqlite")) return "local_keyword";
     if (std.mem.eql(u8, backend, "markdown")) return "markdown_only";
     if (std.mem.eql(u8, backend, "postgres")) return "postgres_keyword";
@@ -808,7 +808,7 @@ fn memoryProfileForBackend(backend: []const u8) []const u8 {
     return "custom";
 }
 
-fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
+pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
         .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
         else => false,
