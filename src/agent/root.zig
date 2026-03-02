@@ -4228,54 +4228,46 @@ test "execBlockMessage checks allowlist when exec_security=allowlist" {
     try std.testing.expect(agent.execBlockMessage(args2) != null);
 }
 
-test "full autonomy with wildcard allowed_commands passes execBlockMessage" {
+test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
     const allocator = std.testing.allocator;
     const policy_mod = @import("../security/policy.zig");
-    var tracker = policy_mod.RateTracker.init(allocator, 10000);
-    defer tracker.deinit();
+    var tracker_open = policy_mod.RateTracker.init(allocator, 10000);
+    defer tracker_open.deinit();
 
-    var policy = policy_mod.SecurityPolicy{
+    var open_policy = policy_mod.SecurityPolicy{
         .autonomy = .full,
         .workspace_dir = "/tmp",
         .allowed_commands = &.{"*"},
         .block_high_risk_commands = false,
         .require_approval_for_medium_risk = false,
-        .tracker = &tracker,
+        .tracker = &tracker_open,
     };
 
-    var cfg = Config{
-        .workspace_dir = "/tmp/yc",
-        .config_path = "/tmp/yc/config.json",
-        .default_model = "openai/gpt-4.1-mini",
-        .allocator = allocator,
+    var tracker_restricted = policy_mod.RateTracker.init(allocator, 10000);
+    defer tracker_restricted.deinit();
+    const restricted_allowed = [_][]const u8{"ls"};
+    var restricted_policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &restricted_allowed,
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker_restricted,
     };
-    cfg.autonomy.level = .full;
-    cfg.autonomy.allowed_commands = &.{"*"};
-    cfg.autonomy.block_high_risk_commands = false;
-    cfg.autonomy.require_approval_for_medium_risk = false;
 
-    var noop = observability.NoopObserver{};
-    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.policy = &policy;
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
 
-    // exec_security should be .full from config
-    try std.testing.expect(agent.exec_security == .full);
-    try std.testing.expect(agent.exec_ask == .off);
+    // Command outside default allowlist should pass with wildcard policy.
+    agent.policy = &open_policy;
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("command", .{ .string = "python3 script.py" });
+    try std.testing.expect(agent.execBlockMessage(args) == null);
 
-    // All commands should pass execBlockMessage
-    var args1 = std.json.ObjectMap.init(allocator);
-    defer args1.deinit();
-    try args1.put("command", .{ .string = "curl https://example.com" });
-    try std.testing.expect(agent.execBlockMessage(args1) == null);
-
-    var args2 = std.json.ObjectMap.init(allocator);
-    defer args2.deinit();
-    try args2.put("command", .{ .string = "rm -rf /tmp/test" });
-    try std.testing.expect(agent.execBlockMessage(args2) == null);
-
-    var args3 = std.json.ObjectMap.init(allocator);
-    defer args3.deinit();
-    try args3.put("command", .{ .string = "python3 script.py" });
-    try std.testing.expect(agent.execBlockMessage(args3) == null);
+    // Same command should be blocked under restrictive allowlist.
+    agent.policy = &restricted_policy;
+    try std.testing.expect(agent.execBlockMessage(args) != null);
 }

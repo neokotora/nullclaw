@@ -397,25 +397,45 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
     );
 }
 
-test "shell with full autonomy and wildcard allows all base commands" {
+test "shell wildcard policy permits command outside default allowlist" {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const policy_mod = @import("../security/policy.zig");
-    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
-    defer tracker.deinit();
-    var policy = policy_mod.SecurityPolicy{
+    var restrictive_tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer restrictive_tracker.deinit();
+    var restrictive_policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &policy_mod.default_allowed_commands,
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &restrictive_tracker,
+    };
+
+    var restrictive_tool = ShellTool{ .workspace_dir = "/tmp", .policy = &restrictive_policy };
+    const restricted_args = try root.parseTestArgs("{\"command\": \"true\"}");
+    defer restricted_args.deinit();
+    const restricted = try restrictive_tool.execute(std.testing.allocator, restricted_args.value.object);
+    defer if (restricted.output.len > 0) std.testing.allocator.free(restricted.output);
+    try std.testing.expect(!restricted.success);
+    try std.testing.expect(restricted.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, restricted.error_msg.?, "Command not allowed") != null);
+
+    var wildcard_tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer wildcard_tracker.deinit();
+    var wildcard_policy = policy_mod.SecurityPolicy{
         .autonomy = .full,
         .workspace_dir = "/tmp",
         .allowed_commands = &.{"*"},
         .block_high_risk_commands = false,
         .require_approval_for_medium_risk = false,
-        .tracker = &tracker,
+        .tracker = &wildcard_tracker,
     };
 
-    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &wildcard_policy };
 
-    const parsed = try root.parseTestArgs("{\"command\": \"echo hello\"}");
+    const parsed = try root.parseTestArgs("{\"command\": \"true\"}");
     defer parsed.deinit();
     const result = try st.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -423,7 +443,7 @@ test "shell with full autonomy and wildcard allows all base commands" {
     try std.testing.expect(result.success);
 }
 
-test "shell without policy allows all commands" {
+test "shell without policy executes command" {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
