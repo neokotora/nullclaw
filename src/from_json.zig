@@ -4,7 +4,6 @@
 /// saves, scaffolds the workspace, and prints {"status":"ok"} on success.
 /// Used by nullhub to configure nullclaw without interactive terminal input.
 const std = @import("std");
-const builtin = @import("builtin");
 const onboard = @import("onboard.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const config_mod = @import("config.zig");
@@ -18,7 +17,7 @@ const WizardAnswers = struct {
     tunnel: ?[]const u8 = null,
     autonomy: ?[]const u8 = null,
     gateway_port: ?u16 = null,
-    /// Comma-separated channel keys (e.g. "cli,web,telegram").
+    /// Comma-separated channel keys (e.g. "cli,webhook,web").
     channels: ?[]const u8 = null,
     /// Override config/workspace directory (used by nullhub for instance isolation).
     /// Falls back to NULLCLAW_HOME env, then ~/.nullclaw/.
@@ -26,11 +25,6 @@ const WizardAnswers = struct {
 };
 
 const AutonomySelectionError = error{InvalidAutonomyLevel};
-const ChannelSelectionError = error{
-    UnknownChannel,
-    ChannelDisabledInBuild,
-    UnsupportedChannelInFromJson,
-};
 
 fn isKnownTunnelProvider(tunnel: []const u8) bool {
     for (onboard.tunnel_options) |option| {
@@ -61,28 +55,78 @@ fn applyAutonomySelection(cfg: *Config, autonomy: []const u8) AutonomySelectionE
     return error.InvalidAutonomyLevel;
 }
 
-fn applyChannelsFromString(cfg: *Config, channels_csv: []const u8) ChannelSelectionError!void {
+fn applyChannelKey(webhook_selected: *bool, channel_key: []const u8) void {
+    const meta = channel_catalog.findByKey(channel_key) orelse return;
+    if (!channel_catalog.isBuildEnabled(meta.id)) return;
+    switch (meta.id) {
+        .webhook => webhook_selected.* = true,
+        .cli, .web => {}, // Always enabled by default, no config needed.
+        else => {}, // Other channels need manual config; silently skip.
+    }
+}
+
+fn applyChannelsFromString(cfg: *Config, channels_csv: []const u8) void {
     var webhook_selected = false;
 
     var it = std.mem.splitScalar(u8, channels_csv, ',');
     while (it.next()) |raw_key| {
         const channel_key = std.mem.trim(u8, raw_key, " ");
         if (channel_key.len == 0) continue;
-
-        const meta = channel_catalog.findByKey(channel_key) orelse {
-            // Unknown channels from wizard are silently ignored (future channels).
-            continue;
-        };
-        if (!channel_catalog.isBuildEnabled(meta.id)) continue;
-
-        switch (meta.id) {
-            .webhook => webhook_selected = true,
-            .cli, .web => {}, // Always enabled by default, no config needed.
-            else => {}, // Other channels need manual config; silently skip.
-        }
+        applyChannelKey(&webhook_selected, channel_key);
     }
 
     cfg.channels.webhook = if (webhook_selected) .{ .port = cfg.gateway.port } else null;
+}
+
+fn initConfigWithCustomHome(backing_allocator: std.mem.Allocator, home_dir: []const u8) !Config {
+    const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer {
+        arena_ptr.deinit();
+        backing_allocator.destroy(arena_ptr);
+    }
+    const allocator = arena_ptr.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "",
+        .config_path = "",
+        .allocator = allocator,
+        .arena = arena_ptr,
+    };
+
+    const config_path = try std.fs.path.join(allocator, &.{ home_dir, "config.json" });
+    const workspace_dir = try std.fs.path.join(allocator, &.{ home_dir, "workspace" });
+    cfg.config_path = config_path;
+    cfg.workspace_dir = workspace_dir;
+    cfg.workspace_dir_override = workspace_dir;
+
+    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+        defer file.close();
+        const content = try file.readToEndAlloc(allocator, 1024 * 64);
+        cfg.parseJson(content) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                std.debug.print("Warning: failed to parse config.json: {s}\n", .{@errorName(err)});
+            },
+        };
+    } else |_| {
+        // No existing config at custom path.
+    }
+
+    // Enforce home-scoped paths for isolated instances.
+    cfg.config_path = config_path;
+    cfg.workspace_dir = workspace_dir;
+    cfg.workspace_dir_override = workspace_dir;
+    cfg.syncFlatFields();
+
+    return cfg;
+}
+
+fn loadConfigForFromJson(allocator: std.mem.Allocator, custom_home: ?[]const u8) !Config {
+    if (custom_home) |home_dir| {
+        return initConfigWithCustomHome(allocator, home_dir);
+    }
+    return Config.load(allocator) catch try onboard.initFreshConfig(allocator);
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -104,18 +148,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer parsed.deinit();
     const answers = parsed.value;
 
+    const env_home = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch null;
+    defer if (env_home) |v| allocator.free(v);
+
     // Resolve home directory: JSON home > NULLCLAW_HOME env > default (~/.nullclaw/)
-    const custom_home: ?[]const u8 = answers.home orelse
-        if (std.posix.getenv("NULLCLAW_HOME")) |env| env else null;
+    const custom_home: ?[]const u8 = answers.home orelse env_home;
 
-    // Load existing config or create fresh, then override paths if custom home
-    var cfg = Config.load(allocator) catch try onboard.initFreshConfig(allocator);
+    // Load config. For custom home, read/write only that home path.
+    var cfg = try loadConfigForFromJson(allocator, custom_home);
     defer cfg.deinit();
-
-    if (custom_home) |home_dir| {
-        cfg.config_path = try cfg.allocator.dupe(u8, try std.fs.path.join(cfg.allocator, &.{ home_dir, "config.json" }));
-        cfg.workspace_dir = try cfg.allocator.dupe(u8, try std.fs.path.join(cfg.allocator, &.{ home_dir, "workspace" }));
-    }
 
     // Apply provider and API key
     if (answers.provider) |p| {
@@ -197,7 +238,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Apply channels (comma-separated string, e.g. "cli,web,webhook").
     // Unknown or unsupported channels are silently skipped.
     if (answers.channels) |channels_csv| {
-        _ = applyChannelsFromString(&cfg, channels_csv) catch {};
+        applyChannelsFromString(&cfg, channels_csv);
     }
 
     // Ensure a valid default model exists even when omitted in JSON payload.
@@ -264,7 +305,7 @@ test "applyChannelsFromString enables webhook from csv" {
         .allocator = std.testing.allocator,
     };
 
-    try applyChannelsFromString(&cfg, "cli,webhook,web");
+    applyChannelsFromString(&cfg, "cli,webhook,web");
     try std.testing.expect(cfg.channels.webhook != null);
     try std.testing.expectEqual(@as(u16, 3000), cfg.channels.webhook.?.port);
 }
@@ -276,7 +317,7 @@ test "applyChannelsFromString ignores unknown channels" {
         .allocator = std.testing.allocator,
     };
 
-    // Unknown channels are silently skipped (future-proofing)
-    try applyChannelsFromString(&cfg, "cli,web,future-channel,telegram");
+    // Unknown channels are silently skipped (future-proofing).
+    applyChannelsFromString(&cfg, "cli,web,future-channel,telegram");
     try std.testing.expect(cfg.channels.webhook == null);
 }
