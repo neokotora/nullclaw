@@ -817,6 +817,35 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
+            // tool_filter_groups: array of { mode, tools, keywords? }
+            if (ag.object.get("tool_filter_groups")) |fg_val| {
+                if (fg_val == .array) {
+                    var fg_list: std.ArrayListUnmanaged(types.ToolFilterGroup) = .empty;
+                    for (fg_val.array.items) |item| {
+                        if (item != .object) continue;
+                        const mode_val = item.object.get("mode") orelse continue;
+                        if (mode_val != .string) continue;
+                        const mode: types.ToolFilterGroupMode = if (std.mem.eql(u8, mode_val.string, "always"))
+                            .always
+                        else if (std.mem.eql(u8, mode_val.string, "dynamic"))
+                            .dynamic
+                        else
+                            continue;
+
+                        var fg = types.ToolFilterGroup{ .mode = mode };
+
+                        if (item.object.get("tools")) |tv| {
+                            if (tv == .array) fg.tools = try parseStringArray(self.allocator, tv.array);
+                        }
+                        if (item.object.get("keywords")) |kv| {
+                            if (kv == .array) fg.keywords = try parseStringArray(self.allocator, kv.array);
+                        }
+
+                        try fg_list.append(self.allocator, fg);
+                    }
+                    self.agent.tool_filter_groups = try fg_list.toOwnedSlice(self.allocator);
+                }
+            }
         }
     }
 
