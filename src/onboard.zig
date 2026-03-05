@@ -9,6 +9,7 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
@@ -2020,7 +2021,7 @@ fn overwriteWorkspaceFile(
     content: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) return true;
@@ -2037,7 +2038,7 @@ fn removeWorkspaceFileIfExists(
     filename: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) {
@@ -2052,7 +2053,7 @@ fn removeWorkspaceFileIfExists(
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
     defer allocator.free(path);
 
     // Only write if file doesn't exist
@@ -2097,7 +2098,7 @@ fn ensureBootstrapLifecycle(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !void {
-    const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
+    const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
 
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
@@ -2148,9 +2149,9 @@ fn isLegacyOnboardingCompleted(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !bool {
-    const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
+    const identity_path = try std.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
     defer allocator.free(identity_path);
-    const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
+    const user_path = try std.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
     defer allocator.free(user_path);
 
     var templates_diverged = false;
@@ -2170,11 +2171,7 @@ fn isLegacyOnboardingCompleted(
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/{s}",
-        .{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE },
-    );
+    return std.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
 }
 
 fn readWorkspaceOnboardingState(
@@ -2309,11 +2306,11 @@ fn pathExistsAbsolute(path: []const u8) bool {
 }
 
 fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
-    const memory_dir_path = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
+    const memory_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
-    const memory_file_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace_dir});
+    const memory_file_path = try std.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
     defer allocator.free(memory_file_path);
-    const git_dir_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{workspace_dir});
+    const git_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".git" });
     defer allocator.free(git_dir_path);
 
     return pathExistsAbsolute(memory_dir_path) or
@@ -2845,6 +2842,28 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
     defer state.deinit(std.testing.allocator);
     try std.testing.expect(state.onboarding_completed_at != null);
+}
+
+test "scaffoldWorkspace handles trailing native separator on Windows paths" {
+    if (builtin.os.tag != .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const workspace_with_sep = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}{s}",
+        .{ base, std.fs.path.sep_str },
+    );
+    defer std.testing.allocator.free(workspace_with_sep);
+
+    try scaffoldWorkspace(std.testing.allocator, workspace_with_sep, &ProjectContext{}, null);
+
+    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    bootstrap_file.close();
 }
 
 // ── Additional onboard tests ────────────────────────────────────
