@@ -75,6 +75,9 @@ pub const OpenAiCompatibleProvider = struct {
     user_agent: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
+    const think_open_tag = "<think>";
+    const think_close_tag = "</think>";
+
     pub fn init(
         allocator: std.mem.Allocator,
         name: []const u8,
@@ -203,7 +206,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (ot == .string) {
                 const trimmed = std.mem.trim(u8, ot.string, " \t\n\r");
                 if (trimmed.len > 0) {
-                    return try allocator.dupe(u8, trimmed);
+                    return stripThinkBlocks(allocator, trimmed);
                 }
             }
         }
@@ -220,7 +223,7 @@ pub const OpenAiCompatibleProvider = struct {
                                     if (text == .string) {
                                         const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
                                         if (trimmed.len > 0) {
-                                            return try allocator.dupe(u8, trimmed);
+                                            return stripThinkBlocks(allocator, trimmed);
                                         }
                                     }
                                 }
@@ -240,7 +243,7 @@ pub const OpenAiCompatibleProvider = struct {
                             if (text == .string) {
                                 const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
                                 if (trimmed.len > 0) {
-                                    return try allocator.dupe(u8, trimmed);
+                                    return stripThinkBlocks(allocator, trimmed);
                                 }
                             }
                         }
@@ -343,6 +346,185 @@ pub const OpenAiCompatibleProvider = struct {
         needs_free: bool,
     };
 
+    const SplitThinkContent = struct {
+        visible: []const u8,
+        reasoning: ?[]const u8,
+    };
+
+    fn scanThinkContent(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        visible_out: *std.ArrayListUnmanaged(u8),
+        reasoning_out: ?*std.ArrayListUnmanaged(u8),
+    ) !void {
+        var i: usize = 0;
+        var depth: usize = 0;
+        while (i < text.len) {
+            if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
+                depth += 1;
+                i += think_open_tag.len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
+                if (depth > 0) depth -= 1;
+                i += think_close_tag.len;
+                continue;
+            }
+
+            if (depth == 0) {
+                try visible_out.append(allocator, text[i]);
+            } else if (reasoning_out) |reasoning_buf| {
+                try reasoning_buf.append(allocator, text[i]);
+            }
+            i += 1;
+        }
+    }
+
+    fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitThinkContent {
+        if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+            return .{
+                .visible = try allocator.dupe(u8, text),
+                .reasoning = null,
+            };
+        }
+
+        var visible_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer visible_buf.deinit(allocator);
+        var reasoning_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer reasoning_buf.deinit(allocator);
+
+        try scanThinkContent(allocator, text, &visible_buf, &reasoning_buf);
+
+        const visible_trimmed = std.mem.trim(u8, visible_buf.items, " \t\r\n");
+        const visible = try allocator.dupe(u8, visible_trimmed);
+        errdefer allocator.free(visible);
+
+        const reasoning_trimmed = std.mem.trim(u8, reasoning_buf.items, " \t\r\n");
+        const reasoning = if (reasoning_trimmed.len > 0) try allocator.dupe(u8, reasoning_trimmed) else null;
+
+        return .{
+            .visible = visible,
+            .reasoning = reasoning,
+        };
+    }
+
+    const ThinkStripStreamCtx = struct {
+        downstream: root.StreamCallback,
+        downstream_ctx: *anyopaque,
+        state: ThinkStripStreamState = .{},
+    };
+
+    const ThinkStripStreamState = struct {
+        depth: usize = 0,
+        pending: [think_close_tag.len]u8 = undefined,
+        pending_len: usize = 0,
+
+        fn feed(self: *ThinkStripStreamState, delta: []const u8, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
+            var out_buf: [256]u8 = undefined;
+            var out_len: usize = 0;
+
+            for (delta) |byte| {
+                if (self.pending_len == self.pending.len) {
+                    self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
+                }
+                self.pending[self.pending_len] = byte;
+                self.pending_len += 1;
+                self.processPending(false, &out_buf, &out_len, downstream, downstream_ctx);
+            }
+
+            if (out_len > 0) {
+                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
+            }
+        }
+
+        fn finish(self: *ThinkStripStreamState, downstream: root.StreamCallback, downstream_ctx: *anyopaque) void {
+            var out_buf: [256]u8 = undefined;
+            var out_len: usize = 0;
+            self.processPending(true, &out_buf, &out_len, downstream, downstream_ctx);
+            if (out_len > 0) {
+                downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len]));
+            }
+        }
+
+        fn processPending(
+            self: *ThinkStripStreamState,
+            final: bool,
+            out_buf: *[256]u8,
+            out_len: *usize,
+            downstream: root.StreamCallback,
+            downstream_ctx: *anyopaque,
+        ) void {
+            while (self.pending_len > 0) {
+                const pending = self.pending[0..self.pending_len];
+
+                if (pending.len >= think_open_tag.len and std.mem.eql(u8, pending[0..think_open_tag.len], think_open_tag)) {
+                    self.consumePrefix(think_open_tag.len);
+                    self.depth += 1;
+                    continue;
+                }
+
+                if (pending.len >= think_close_tag.len and std.mem.eql(u8, pending[0..think_close_tag.len], think_close_tag)) {
+                    self.consumePrefix(think_close_tag.len);
+                    if (self.depth > 0) self.depth -= 1;
+                    continue;
+                }
+
+                const maybe_tag_prefix = std.mem.startsWith(u8, think_open_tag, pending) or std.mem.startsWith(u8, think_close_tag, pending);
+                if (!final and maybe_tag_prefix and pending.len < think_close_tag.len) {
+                    break;
+                }
+
+                if (self.depth == 0) {
+                    out_buf[out_len.*] = pending[0];
+                    out_len.* += 1;
+                    if (out_len.* == out_buf.len) {
+                        downstream(downstream_ctx, root.StreamChunk.textDelta(out_buf[0..out_len.*]));
+                        out_len.* = 0;
+                    }
+                }
+                self.consumePrefix(1);
+            }
+        }
+
+        fn consumePrefix(self: *ThinkStripStreamState, n: usize) void {
+            std.debug.assert(n <= self.pending_len);
+            if (n == self.pending_len) {
+                self.pending_len = 0;
+                return;
+            }
+            const remaining = self.pending_len - n;
+            std.mem.copyForwards(u8, self.pending[0..remaining], self.pending[n..self.pending_len]);
+            self.pending_len = remaining;
+        }
+    };
+
+    fn streamThinkSanitizeCallback(ctx_ptr: *anyopaque, chunk: root.StreamChunk) void {
+        const ctx: *ThinkStripStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (chunk.is_final) {
+            ctx.state.finish(ctx.downstream, ctx.downstream_ctx);
+            ctx.downstream(ctx.downstream_ctx, root.StreamChunk.finalChunk());
+            return;
+        }
+        ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
+    }
+
+    fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+        if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+            return allocator.dupe(u8, text);
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        try scanThinkContent(allocator, text, &out, null);
+
+        const cleaned = try out.toOwnedSlice(allocator);
+        const trimmed = std.mem.trim(u8, cleaned, " \t\r\n");
+        if (trimmed.ptr == cleaned.ptr and trimmed.len == cleaned.len) return cleaned;
+        defer allocator.free(cleaned);
+        return allocator.dupe(u8, trimmed);
+    }
+
     /// Parse text content from an OpenAI-compatible response.
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -358,7 +540,7 @@ pub const OpenAiCompatibleProvider = struct {
                 if (choices.array.items[0].object.get("message")) |msg| {
                     if (msg.object.get("content")) |content| {
                         if (content == .string) {
-                            return try allocator.dupe(u8, content.string);
+                            return stripThinkBlocks(allocator, content.string);
                         }
                     }
                 }
@@ -384,9 +566,12 @@ pub const OpenAiCompatibleProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                var reasoning_content: ?[]const u8 = null;
                 if (msg_obj.get("content")) |c| {
                     if (c == .string) {
-                        content = try allocator.dupe(u8, c.string);
+                        const split = try splitThinkContent(allocator, c.string);
+                        content = split.visible;
+                        reasoning_content = split.reasoning;
                     }
                 }
 
@@ -433,6 +618,7 @@ pub const OpenAiCompatibleProvider = struct {
                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
                     .usage = usage,
                     .model = model_str,
+                    .reasoning_content = reasoning_content,
                 };
             }
         }
@@ -500,7 +686,35 @@ pub const OpenAiCompatibleProvider = struct {
             extra_header_count += 1;
         }
 
-        return sse.curlStream(allocator, url, body, auth_hdr, extra_headers[0..extra_header_count], request.timeout_secs, callback, callback_ctx);
+        var sanitize_ctx = ThinkStripStreamCtx{
+            .downstream = callback,
+            .downstream_ctx = callback_ctx,
+        };
+
+        var result = try sse.curlStream(
+            allocator,
+            url,
+            body,
+            auth_hdr,
+            extra_headers[0..extra_header_count],
+            request.timeout_secs,
+            streamThinkSanitizeCallback,
+            @ptrCast(&sanitize_ctx),
+        );
+
+        if (result.content) |raw| {
+            const cleaned = try stripThinkBlocks(allocator, raw);
+            allocator.free(raw);
+            if (cleaned.len == 0) {
+                result.content = null;
+                result.usage.completion_tokens = 0;
+            } else {
+                result.content = cleaned;
+                result.usage.completion_tokens = @intCast((cleaned.len + 3) / 4);
+            }
+        }
+
+        return result;
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
@@ -840,6 +1054,113 @@ test "parseTextResponse extracts content" {
     try std.testing.expectEqualStrings("Hello from Venice!", result);
 }
 
+test "parseTextResponse strips think blocks" {
+    const body =
+        \\{"choices":[{"message":{"content":"<think>private reasoning</think>\nVisible answer"}}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Visible answer", result);
+}
+
+test "parseNativeResponse splits think blocks into content and reasoning_content" {
+    const body =
+        \\{"choices":[{"message":{"content":"<think>private chain of thought</think>\nVisible answer"}}],"model":"minimax-m2.5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |content| {
+            if (content.len > 0) std.testing.allocator.free(content);
+        }
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |reasoning| {
+            if (reasoning.len > 0) std.testing.allocator.free(reasoning);
+        }
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Visible answer", result.content.?);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("private chain of thought", result.reasoning_content.?);
+}
+
+test "streamThinkSanitizeCallback strips think blocks across chunk boundaries" {
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
+        .downstream = Collector.callback,
+        .downstream_ctx = @ptrCast(&collector),
+    };
+
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("<thi"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("nk>private reasoning"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("</think>\nVisible answer"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expectEqualStrings("\nVisible answer", collector.buf.items);
+}
+
+test "streamThinkSanitizeCallback preserves incomplete think tag literals" {
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        saw_final: bool = false,
+
+        fn callback(ctx: *anyopaque, chunk: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.saw_final = true;
+                return;
+            }
+            self.buf.appendSlice(self.allocator, chunk.delta) catch unreachable;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(self.allocator);
+        }
+    };
+
+    var collector = Collector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var sanitize_ctx = OpenAiCompatibleProvider.ThinkStripStreamCtx{
+        .downstream = Collector.callback,
+        .downstream_ctx = @ptrCast(&collector),
+    };
+
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.textDelta("literal <thi"));
+    OpenAiCompatibleProvider.streamThinkSanitizeCallback(@ptrCast(&sanitize_ctx), root.StreamChunk.finalChunk());
+
+    try std.testing.expect(collector.saw_final);
+    try std.testing.expectEqualStrings("literal <thi", collector.buf.items);
+}
+
 test "parseTextResponse empty choices" {
     const body =
         \\{"choices":[]}
@@ -1063,6 +1384,15 @@ test "extractResponsesText top-level output_text" {
     const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("Hello from top-level", result);
+}
+
+test "extractResponsesText strips think blocks" {
+    const body =
+        \\{"output_text":"<think>private reasoning</think>\nVisible answer","output":[]}
+    ;
+    const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Visible answer", result);
 }
 
 test "extractResponsesText nested output_text type" {

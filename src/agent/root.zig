@@ -290,6 +290,10 @@ pub const Agent = struct {
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
 
+    /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
+    /// Empty = no filtering; all tool specs are sent as-is.
+    tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
+
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
@@ -402,6 +406,7 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .tool_filter_groups = cfg.agent.tool_filter_groups,
             .exec_security = switch (cfg.autonomy.level) {
                 .full => .full,
                 .read_only => .deny,
@@ -437,6 +442,83 @@ pub const Agent = struct {
     /// Estimate total tokens in conversation history.
     pub fn tokenEstimate(self: *const Agent) u64 {
         return compaction.tokenEstimate(self.history.items);
+    }
+
+    /// Rough token estimate for provider-ready messages.
+    /// Uses a char-based heuristic (1 token ~= 4 chars) plus structural overhead.
+    fn estimatePromptTokens(messages: []const ChatMessage) u64 {
+        var total_chars: u64 = 0;
+        for (messages) |msg| {
+            if (msg.name) |name| total_chars +|= name.len;
+            if (msg.tool_call_id) |tool_call_id| total_chars +|= tool_call_id.len;
+            if (msg.content_parts) |parts| {
+                // content_parts are the provider-facing payload; avoid double counting
+                // mirrored plain `content` unless parts are unexpectedly empty.
+                if (parts.len == 0) total_chars +|= msg.content.len;
+                for (parts) |part| switch (part) {
+                    .text => |text| total_chars +|= text.len,
+                    .image_url => |img| total_chars +|= img.url.len + 32,
+                    .image_base64 => |img| total_chars +|= img.data.len + img.media_type.len + 32,
+                };
+            } else {
+                total_chars +|= msg.content.len;
+            }
+        }
+
+        const structural_chars: u64 = @as(u64, @intCast(messages.len)) * 32;
+        return (total_chars + structural_chars + 3) / 4;
+    }
+
+    fn estimateToolSpecsTokens(tool_specs: []const ToolSpec) u64 {
+        var total_chars: u64 = 0;
+        for (tool_specs) |spec| {
+            total_chars +|= spec.name.len;
+            total_chars +|= spec.description.len;
+            total_chars +|= spec.parameters_json.len;
+        }
+
+        const structural_chars: u64 = @as(u64, @intCast(tool_specs.len)) * 48;
+        return (total_chars + structural_chars + 3) / 4;
+    }
+
+    /// Clamp completion tokens to fit within the configured context budget.
+    /// Keeps a safety headroom to reduce ContextLengthExceeded errors on strict providers.
+    fn effectiveMaxTokensForMessages(
+        self: *const Agent,
+        messages: []const ChatMessage,
+        include_tool_specs: bool,
+    ) u32 {
+        return self.effectiveMaxTokensForMessagesWithToolSpecs(
+            messages,
+            if (include_tool_specs) self.tool_specs else null,
+        );
+    }
+
+    /// Variant of effectiveMaxTokensForMessages that accepts the exact tool schema set
+    /// used for this request. This avoids overestimating prompt size when MCP schemas
+    /// are filtered per turn.
+    fn effectiveMaxTokensForMessagesWithToolSpecs(
+        self: *const Agent,
+        messages: []const ChatMessage,
+        tool_specs_for_estimate: ?[]const ToolSpec,
+    ) u32 {
+        if (self.token_limit == 0) return self.max_tokens;
+
+        var prompt_estimate = estimatePromptTokens(messages);
+        if (tool_specs_for_estimate) |tool_specs| {
+            prompt_estimate +|= estimateToolSpecsTokens(tool_specs);
+        }
+
+        if (prompt_estimate >= self.token_limit) return 1;
+
+        const available = self.token_limit - prompt_estimate;
+        const reserve = @min(@as(u64, 256), available / 4);
+        if (available <= reserve) return 1;
+
+        const completion_budget = available - reserve;
+        const completion_budget_u32: u32 = @intCast(@min(completion_budget, @as(u64, std.math.maxInt(u32))));
+        if (completion_budget_u32 == 0) return 1;
+        return @max(@as(u32, 1), @min(self.max_tokens, completion_budget_u32));
     }
 
     /// Auto-compact history when it exceeds thresholds.
@@ -671,6 +753,88 @@ pub const Agent = struct {
         return commands.handleSlashCommand(self, message);
     }
 
+    /// Returns true if `name` matches `pattern` using simple `*` glob.
+    /// `*` matches any sequence of characters (including none).
+    fn globMatch(pattern: []const u8, name: []const u8) bool {
+        // Fast paths
+        if (std.mem.eql(u8, pattern, "*")) return true;
+        const star = std.mem.indexOfScalar(u8, pattern, '*') orelse {
+            return std.mem.eql(u8, pattern, name);
+        };
+        const prefix = pattern[0..star];
+        const suffix = pattern[star + 1 ..];
+        if (!std.mem.startsWith(u8, name, prefix)) return false;
+        if (suffix.len == 0) return true;
+        // suffix must appear at end (handles single-`*` patterns only)
+        if (name.len < prefix.len + suffix.len) return false;
+        return std.mem.endsWith(u8, name, suffix);
+    }
+
+    /// Filter `self.tool_specs` for the current turn based on `tool_filter_groups`.
+    ///
+    /// Returns a slice allocated from `arena` containing only the specs that should
+    /// be included for this turn.  The returned slice borrows pointers from
+    /// `self.tool_specs` — it must NOT outlive `self.tool_specs`.
+    ///
+    /// Rules:
+    ///   - If no filter groups are configured, returns `self.tool_specs` directly (no copy).
+    ///   - A tool whose name does NOT start with "mcp_" is always included.
+    ///   - `always` groups unconditionally include matching MCP tools.
+    ///   - `dynamic` groups include matching MCP tools when the user message contains
+    ///     at least one of the group's keywords (case-insensitive substring match).
+    fn filterToolSpecsForTurn(
+        self: *const Agent,
+        arena: std.mem.Allocator,
+        user_message: []const u8,
+    ) ![]const ToolSpec {
+        if (self.tool_filter_groups.len == 0) return self.tool_specs;
+
+        var result: std.ArrayListUnmanaged(ToolSpec) = .empty;
+
+        for (self.tool_specs) |spec| {
+            // Non-MCP tools are always included.
+            if (!std.mem.startsWith(u8, spec.name, "mcp_")) {
+                try result.append(arena, spec);
+                continue;
+            }
+
+            var include = false;
+            for (self.tool_filter_groups) |group| {
+                // Check if any pattern in this group matches the tool name.
+                var pattern_matched = false;
+                for (group.tools) |pattern| {
+                    if (globMatch(pattern, spec.name)) {
+                        pattern_matched = true;
+                        break;
+                    }
+                }
+                if (!pattern_matched) continue;
+
+                switch (group.mode) {
+                    .always => {
+                        include = true;
+                        break;
+                    },
+                    .dynamic => {
+                        // Case-insensitive ASCII substring match for configured keywords.
+                        for (group.keywords) |kw| {
+                            if (containsAsciiIgnoreCase(user_message, kw)) {
+                                include = true;
+                                break;
+                            }
+                            if (include) break;
+                        }
+                        if (include) break;
+                    },
+                }
+            }
+
+            if (include) try result.append(arena, spec);
+        }
+
+        return result.toOwnedSlice(arena);
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
@@ -833,6 +997,13 @@ pub const Agent = struct {
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
 
+            // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
+            const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
+            const request_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                messages,
+                if (native_tools_enabled) turn_tool_specs else null,
+            );
+
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
@@ -844,7 +1015,7 @@ pub const Agent = struct {
                         .messages = messages,
                         .model = self.model_name,
                         .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
+                        .max_tokens = request_max_tokens,
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
@@ -880,8 +1051,8 @@ pub const Agent = struct {
                         .messages = messages,
                         .model = self.model_name,
                         .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
-                        .tools = if (native_tools_enabled) self.tool_specs else null,
+                        .max_tokens = request_max_tokens,
+                        .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
@@ -907,6 +1078,10 @@ pub const Agent = struct {
                     {
                         self.context_was_compacted = true;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                        const recovery_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                            recovery_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                        );
                         response_attempt = 2;
                         self.logLlmRequest(iteration + 1, 2, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
@@ -915,8 +1090,8 @@ pub const Agent = struct {
                                 .messages = recovery_msgs,
                                 .model = self.model_name,
                                 .temperature = self.temperature,
-                                .max_tokens = self.max_tokens,
-                                .tools = if (native_tools_enabled) self.tool_specs else null,
+                                .max_tokens = recovery_max_tokens,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
@@ -938,8 +1113,8 @@ pub const Agent = struct {
                             .messages = messages,
                             .model = self.model_name,
                             .temperature = self.temperature,
-                            .max_tokens = self.max_tokens,
-                            .tools = if (native_tools_enabled) self.tool_specs else null,
+                            .max_tokens = request_max_tokens,
+                            .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
                         },
@@ -951,6 +1126,10 @@ pub const Agent = struct {
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                            const recovery_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                                recovery_msgs,
+                                if (native_tools_enabled) turn_tool_specs else null,
+                            );
                             response_attempt = 3;
                             self.logLlmRequest(iteration + 1, 3, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
@@ -959,8 +1138,8 @@ pub const Agent = struct {
                                     .messages = recovery_msgs,
                                     .model = self.model_name,
                                     .temperature = self.temperature,
-                                    .max_tokens = self.max_tokens,
-                                    .tools = if (native_tools_enabled) self.tool_specs else null,
+                                    .max_tokens = recovery_max_tokens,
+                                    .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
                                 },
@@ -1284,6 +1463,7 @@ pub const Agent = struct {
             return fallback;
         };
         defer self.allocator.free(summary_messages);
+        const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
         self.logLlmRequest(self.max_tool_iterations + 1, 1, summary_messages, false, false);
         var summary_response = self.provider.chat(
@@ -1292,7 +1472,7 @@ pub const Agent = struct {
                 .messages = summary_messages,
                 .model = self.model_name,
                 .temperature = self.temperature,
-                .max_tokens = self.max_tokens,
+                .max_tokens = summary_max_tokens,
                 .tools = null, // force text-only
                 .timeout_secs = self.message_timeout_secs,
                 .reasoning_effort = self.reasoning_effort,
@@ -2525,6 +2705,274 @@ test "Agent.fromConfig resolves max_tokens from provider lookup when unset" {
 
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
     try std.testing.expect(agent.max_tokens_override == null);
+}
+
+test "Agent.fromConfig resolves conservative limits for legacy gpt-4" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4",
+        .allocator = allocator,
+    };
+    cfg.max_tokens = null;
+    cfg.agent.token_limit = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
+    cfg.agent.token_limit_explicit = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u64, 8_192), agent.token_limit);
+    try std.testing.expectEqual(@as(u32, 4_096), agent.max_tokens);
+}
+
+test "Agent effective max_tokens reserves prompt headroom" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 8_192,
+        .max_tokens = 4_096,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const large_system = try allocator.alloc(u8, 28_000);
+    defer allocator.free(large_system);
+    @memset(large_system, 'a');
+
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = large_system },
+        .{ .role = .user, .content = "how are you?" },
+    };
+    const capped = agent.effectiveMaxTokensForMessages(&messages, false);
+    try std.testing.expect(capped < agent.max_tokens);
+    try std.testing.expect(capped > 0);
+}
+
+test "Agent effective max_tokens does not double count plain content with content_parts" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 1_000,
+        .max_tokens = 512,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const long_text = try allocator.alloc(u8, 2_000);
+    defer allocator.free(long_text);
+    @memset(long_text, 'a');
+
+    const parts = [_]providers.ContentPart{
+        .{ .text = long_text },
+    };
+    const messages = [_]ChatMessage{
+        .{
+            .role = .user,
+            .content = long_text,
+            .content_parts = &parts,
+        },
+    };
+
+    const capped = agent.effectiveMaxTokensForMessages(&messages, false);
+    try std.testing.expect(capped > 1);
+}
+
+test "Agent effective max_tokens scales with image_base64 size" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 4_000,
+        .max_tokens = 2_000,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const small_base64 = try allocator.alloc(u8, 120);
+    defer allocator.free(small_base64);
+    @memset(small_base64, 'a');
+
+    const large_base64 = try allocator.alloc(u8, 12_000);
+    defer allocator.free(large_base64);
+    @memset(large_base64, 'b');
+
+    const small_parts = [_]providers.ContentPart{
+        .{ .text = "describe this image" },
+        .{ .image_base64 = .{ .data = small_base64, .media_type = "image/png" } },
+    };
+    const large_parts = [_]providers.ContentPart{
+        .{ .text = "describe this image" },
+        .{ .image_base64 = .{ .data = large_base64, .media_type = "image/png" } },
+    };
+
+    const small_messages = [_]ChatMessage{
+        .{
+            .role = .user,
+            .content = "describe this image",
+            .content_parts = &small_parts,
+        },
+    };
+    const large_messages = [_]ChatMessage{
+        .{
+            .role = .user,
+            .content = "describe this image",
+            .content_parts = &large_parts,
+        },
+    };
+
+    const capped_small = agent.effectiveMaxTokensForMessages(&small_messages, false);
+    const capped_large = agent.effectiveMaxTokensForMessages(&large_messages, false);
+    try std.testing.expect(capped_large < capped_small);
+}
+
+test "Agent effective max_tokens accounts for native tool schema overhead" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    const tool_specs = try allocator.alloc(ToolSpec, 2);
+
+    var params_a: [2_000]u8 = undefined;
+    @memset(params_a[0..], 'a');
+    var params_b: [2_000]u8 = undefined;
+    @memset(params_b[0..], 'b');
+
+    tool_specs[0] = .{
+        .name = "file_write",
+        .description = "Write file content",
+        .parameters_json = params_a[0..],
+    };
+    tool_specs[1] = .{
+        .name = "file_edit",
+        .description = "Edit file content",
+        .parameters_json = params_b[0..],
+    };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = tool_specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 2_000,
+        .max_tokens = 1_000,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+
+    const without_tools = agent.effectiveMaxTokensForMessages(&messages, false);
+    const with_tools = agent.effectiveMaxTokensForMessages(&messages, true);
+    try std.testing.expect(with_tools < without_tools);
+}
+
+test "Agent effective max_tokens can estimate using filtered tool schemas" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    const tool_specs = try allocator.alloc(ToolSpec, 2);
+
+    var params_a: [3_000]u8 = undefined;
+    @memset(params_a[0..], 'a');
+    var params_b: [3_000]u8 = undefined;
+    @memset(params_b[0..], 'b');
+
+    tool_specs[0] = .{
+        .name = "mcp_vikunja_list_tasks",
+        .description = "List tasks",
+        .parameters_json = params_a[0..],
+    };
+    tool_specs[1] = .{
+        .name = "mcp_browser_open",
+        .description = "Open browser",
+        .parameters_json = params_b[0..],
+    };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = tool_specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 2_200,
+        .max_tokens = 1_000,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "show my tasks" },
+    };
+
+    const with_all_tools = agent.effectiveMaxTokensForMessagesWithToolSpecs(&messages, tool_specs);
+    const with_filtered_tools = agent.effectiveMaxTokensForMessagesWithToolSpecs(&messages, tool_specs[0..1]);
+    try std.testing.expect(with_filtered_tools > with_all_tools);
 }
 
 test "Agent.fromConfig keeps explicit max_tokens override" {
@@ -4481,4 +4929,159 @@ test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
     // Same command should be blocked under restrictive allowlist.
     agent.policy = &restricted_policy;
     try std.testing.expect(agent.execBlockMessage(args) != null);
+}
+
+// ── filterToolSpecsForTurn tests ─────────────────────────────────
+
+test "filterToolSpecsForTurn no groups returns all specs unchanged" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "list tasks", .parameters_json = "{}" },
+    };
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    // Override tool_specs to our test set (not heap-alloc'd via fromConfig)
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = &.{}; // explicitly empty
+
+    const result = try agent.filterToolSpecsForTurn(arena, "show me tasks");
+    // Should be same pointer — no copy made
+    try std.testing.expectEqual(specs.ptr, result.ptr);
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    // Prevent double-free: clear the pointer so deinit doesn't free it
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn always group always includes matching MCP tool" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "list tasks", .parameters_json = "{}" },
+        .{ .name = "mcp_browser_open", .description = "open browser", .parameters_json = "{}" },
+    };
+    const patterns: []const []const u8 = &.{"mcp_vikunja_*"};
+    const groups: []const config_types.ToolFilterGroup = &.{
+        .{ .mode = .always, .tools = patterns, .keywords = &.{} },
+    };
+
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = groups;
+
+    const result = try agent.filterToolSpecsForTurn(arena, "hello world");
+    // shell (non-MCP) + mcp_vikunja_list_tasks (always matched); mcp_browser_open excluded
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name);
+    try std.testing.expectEqualStrings("mcp_vikunja_list_tasks", result[1].name);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn dynamic group includes tool on keyword match" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "list tasks", .parameters_json = "{}" },
+    };
+    const patterns: []const []const u8 = &.{"mcp_vikunja_*"};
+    const keywords: []const []const u8 = &.{ "task", "vikunja", "todo" };
+    const groups: []const config_types.ToolFilterGroup = &.{
+        .{ .mode = .dynamic, .tools = patterns, .keywords = keywords },
+    };
+
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = groups;
+
+    // Keyword present — tool should be included
+    const with_kw = try agent.filterToolSpecsForTurn(arena, "show me my tasks for today");
+    try std.testing.expectEqual(@as(usize, 2), with_kw.len);
+    try std.testing.expectEqualStrings("mcp_vikunja_list_tasks", with_kw[1].name);
+
+    // No keyword — MCP tool should be excluded
+    const without_kw = try agent.filterToolSpecsForTurn(arena, "what is the weather?");
+    try std.testing.expectEqual(@as(usize, 1), without_kw.len);
+    try std.testing.expectEqualStrings("shell", without_kw[0].name);
+
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn dynamic group keyword match is case-insensitive" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "mcp_vikunja_create_task", .description = "create task", .parameters_json = "{}" },
+    };
+    const patterns: []const []const u8 = &.{"mcp_vikunja_*"};
+    const keywords: []const []const u8 = &.{"task"};
+    const groups: []const config_types.ToolFilterGroup = &.{
+        .{ .mode = .dynamic, .tools = patterns, .keywords = keywords },
+    };
+
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = groups;
+
+    const result = try agent.filterToolSpecsForTurn(arena, "Create a TASK for me");
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "globMatch handles prefix wildcard" {
+    try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_list_tasks"));
+    try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_create_task"));
+    try std.testing.expect(!Agent.globMatch("mcp_vikunja_*", "mcp_browser_open"));
+    try std.testing.expect(Agent.globMatch("*", "anything"));
+    try std.testing.expect(Agent.globMatch("shell", "shell"));
+    try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
 }

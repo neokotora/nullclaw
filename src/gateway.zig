@@ -2617,6 +2617,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
                 .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
                 .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+                .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
                 .tracker = if (sec_tracker_opt) |*tracker| tracker else null,
             };
 

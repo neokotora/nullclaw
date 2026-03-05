@@ -18,6 +18,31 @@ const SAFE_ENV_VARS = [_][]const u8{
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 };
 
+fn normalizeCommandInput(command: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (unwrapMarkdownFence(trimmed)) |unfenced| {
+        return std.mem.trim(u8, unfenced, " \t\r\n");
+    }
+    return trimmed;
+}
+
+fn unwrapMarkdownFence(command: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, command, "```")) return null;
+    const after_open = command[3..];
+    const close_idx = std.mem.lastIndexOf(u8, after_open, "```") orelse return null;
+    const trailing = std.mem.trim(u8, after_open[close_idx + 3 ..], " \t\r\n");
+    if (trailing.len != 0) return null;
+
+    const fenced_body = after_open[0..close_idx];
+    const content = if (std.mem.indexOfScalar(u8, fenced_body, '\n')) |first_newline|
+        fenced_body[first_newline + 1 ..]
+    else
+        fenced_body;
+    const trimmed_content = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed_content.len == 0) return null;
+    return trimmed_content;
+}
+
 /// Shell command execution tool with workspace scoping.
 pub const ShellTool = struct {
     workspace_dir: []const u8,
@@ -43,8 +68,9 @@ pub const ShellTool = struct {
 
     pub fn execute(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         // Parse the command from the pre-parsed JSON object
-        const command = root.getString(args, "command") orelse
+        const command_input = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
+        const command = normalizeCommandInput(command_input);
 
         // Validate command against security policy
         if (self.policy) |pol| {
@@ -393,6 +419,55 @@ test "shell wildcard policy permits command outside default allowlist" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
+}
+
+test "shell accepts markdown-fenced command payload" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 1000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"```bash\\necho fenced\\n```\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "fenced") != null);
+}
+
+test "shell keeps subshell backticks blocked after fenced markdown normalization" {
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 1000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"```bash\\necho `whoami`\\n```\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Command not allowed") != null);
 }
 
 test "shell without policy executes command" {

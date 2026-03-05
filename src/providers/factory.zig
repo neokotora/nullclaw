@@ -5,6 +5,7 @@ const anthropic = @import("anthropic.zig");
 const openai = @import("openai.zig");
 const ollama = @import("ollama.zig");
 const gemini = @import("gemini.zig");
+const vertex = @import("vertex.zig");
 const openrouter = @import("openrouter.zig");
 const compatible = @import("compatible.zig");
 const claude_cli = @import("claude_cli.zig");
@@ -17,6 +18,7 @@ pub const ProviderKind = enum {
     openrouter_provider,
     ollama_provider,
     gemini_provider,
+    vertex_provider,
     compatible_provider,
     claude_cli_provider,
     codex_cli_provider,
@@ -182,6 +184,9 @@ const core_providers = std.StaticStringMap(ProviderKind).initComptime(.{
     .{ "gemini", .gemini_provider },
     .{ "google", .gemini_provider },
     .{ "google-gemini", .gemini_provider },
+    .{ "vertex", .vertex_provider },
+    .{ "vertex-ai", .vertex_provider },
+    .{ "google-vertex", .vertex_provider },
     .{ "claude-cli", .claude_cli_provider },
     .{ "codex-cli", .codex_cli_provider },
     .{ "openai-codex", .openai_codex_provider },
@@ -215,6 +220,7 @@ pub fn detectProviderByApiKey(key: []const u8) ProviderKind {
     if (std.mem.startsWith(u8, key, "pplx-")) return .compatible_provider;
     if (std.mem.startsWith(u8, key, "AKIA")) return .compatible_provider;
     if (std.mem.startsWith(u8, key, "AIza")) return .gemini_provider;
+    if (std.mem.startsWith(u8, key, "ya29.")) return .vertex_provider;
     return .unknown;
 }
 
@@ -237,6 +243,7 @@ pub const ProviderHolder = union(enum) {
     anthropic: anthropic.AnthropicProvider,
     openai: openai.OpenAiProvider,
     gemini: gemini.GeminiProvider,
+    vertex: vertex.VertexProvider,
     ollama: ollama.OllamaProvider,
     compatible: compatible.OpenAiCompatibleProvider,
     claude_cli: claude_cli.ClaudeCliProvider,
@@ -250,6 +257,7 @@ pub const ProviderHolder = union(enum) {
             .anthropic => |*p| p.provider(),
             .openai => |*p| p.provider(),
             .gemini => |*p| p.provider(),
+            .vertex => |*p| p.provider(),
             .ollama => |*p| p.provider(),
             .compatible => |*p| p.provider(),
             .claude_cli => |*p| p.provider(),
@@ -285,6 +293,7 @@ pub const ProviderHolder = union(enum) {
             ) },
             .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent) },
             .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
+            .vertex_provider => .{ .vertex = vertex.VertexProvider.init(allocator, api_key, base_url) },
             .ollama_provider => .{ .ollama = ollama.OllamaProvider.init(allocator, base_url) },
             .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
             .compatible_provider => blk: {
@@ -357,6 +366,9 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("ollama") == .ollama_provider);
     try std.testing.expect(classifyProvider("gemini") == .gemini_provider);
     try std.testing.expect(classifyProvider("google") == .gemini_provider);
+    try std.testing.expect(classifyProvider("vertex") == .vertex_provider);
+    try std.testing.expect(classifyProvider("vertex-ai") == .vertex_provider);
+    try std.testing.expect(classifyProvider("google-vertex") == .vertex_provider);
     try std.testing.expect(classifyProvider("groq") == .compatible_provider);
     try std.testing.expect(classifyProvider("mistral") == .compatible_provider);
     try std.testing.expect(classifyProvider("deepseek") == .compatible_provider);
@@ -577,6 +589,10 @@ test "detectProviderByApiKey gemini" {
     try std.testing.expect(detectProviderByApiKey("AIzaSyAbc123") == .gemini_provider);
 }
 
+test "detectProviderByApiKey vertex oauth token" {
+    try std.testing.expect(detectProviderByApiKey("ya29.a0AfH6SMD-abc123") == .vertex_provider);
+}
+
 test "detectProviderByApiKey unknown" {
     try std.testing.expect(detectProviderByApiKey("random-key") == .unknown);
 }
@@ -590,6 +606,7 @@ test "ProviderHolder tagged union has all expected fields" {
     try std.testing.expect(@hasField(ProviderHolder, "anthropic"));
     try std.testing.expect(@hasField(ProviderHolder, "openai"));
     try std.testing.expect(@hasField(ProviderHolder, "gemini"));
+    try std.testing.expect(@hasField(ProviderHolder, "vertex"));
     try std.testing.expect(@hasField(ProviderHolder, "ollama"));
     try std.testing.expect(@hasField(ProviderHolder, "compatible"));
     try std.testing.expect(@hasField(ProviderHolder, "claude_cli"));
@@ -611,6 +628,10 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null);
     defer h3.deinit();
     try std.testing.expect(h3 == .gemini);
+    // vertex
+    var h3b = ProviderHolder.fromConfig(alloc, "vertex", "ya29.token", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models", true, null);
+    defer h3b.deinit();
+    try std.testing.expect(h3b == .vertex);
     // ollama
     var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true, null);
     defer h4.deinit();

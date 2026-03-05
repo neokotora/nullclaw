@@ -51,6 +51,7 @@ pub fn runTaskWithTools(
         .max_actions_per_hour = request.max_actions_per_hour,
         .require_approval_for_medium_risk = request.require_approval_for_medium_risk,
         .block_high_risk_commands = request.block_high_risk_commands,
+        .allow_raw_url_chars = request.allow_raw_url_chars,
         .tracker = &tracker,
     };
 
@@ -98,6 +99,7 @@ pub fn runTaskWithTools(
             .max_actions_per_hour = request.max_actions_per_hour,
             .require_approval_for_medium_risk = request.require_approval_for_medium_risk,
             .block_high_risk_commands = request.block_high_risk_commands,
+            .allow_raw_url_chars = request.allow_raw_url_chars,
             .allowed_commands = request.allowed_commands,
             .allowed_paths = request.allowed_paths,
         },

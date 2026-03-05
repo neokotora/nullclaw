@@ -1741,6 +1741,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .max_actions_per_hour = config.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
         .tracker = &tracker,
     };
 
@@ -2061,6 +2062,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .max_actions_per_hour = config.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
         .tracker = &tracker,
     };
 

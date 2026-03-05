@@ -84,6 +84,7 @@ pub const known_providers = [_]ProviderInfo{
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
+    .{ .key = "vertex", .label = "Google Vertex AI (Gemini)", .default_model = "gemini-2.5-pro", .env_var = "VERTEX_API_KEY" },
     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
 
@@ -135,6 +136,7 @@ pub fn canonicalProviderName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "grok")) return "xai";
     if (std.mem.eql(u8, name, "together")) return "together-ai";
     if (std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return "gemini";
+    if (std.mem.eql(u8, name, "vertex-ai") or std.mem.eql(u8, name, "google-vertex")) return "vertex";
     if (std.mem.eql(u8, name, "claude-code")) return "claude-cli";
     return name;
 }
@@ -231,6 +233,7 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "groq")) return &groq_fallback;
     if (std.mem.eql(u8, canonical, "anthropic")) return &anthropic_fallback;
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
+    if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
@@ -294,6 +297,11 @@ const anthropic_fallback = [_][]const u8{
     "claude-haiku-4-5",
 };
 const gemini_fallback = [_][]const u8{
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+};
+const vertex_fallback = [_][]const u8{
     "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -365,6 +373,7 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     // Providers with no models-list API
     if (std.mem.eql(u8, canonical, "anthropic") or
         std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "vertex") or
         std.mem.eql(u8, canonical, "deepseek") or
         std.mem.eql(u8, canonical, "ollama") or
         std.mem.eql(u8, canonical, "claude-cli") or
@@ -2417,6 +2426,8 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("together-ai", canonicalProviderName("together"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google-gemini"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex-ai"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("google-vertex"));
     try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
@@ -2841,6 +2852,7 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
 test "canonicalProviderName passthrough for known providers" {
     try std.testing.expectEqualStrings("anthropic", canonicalProviderName("anthropic"));
     try std.testing.expectEqualStrings("openrouter", canonicalProviderName("openrouter"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex"));
     try std.testing.expectEqualStrings("deepseek", canonicalProviderName("deepseek"));
     try std.testing.expectEqualStrings("groq", canonicalProviderName("groq"));
     try std.testing.expectEqualStrings("ollama", canonicalProviderName("ollama"));
@@ -2921,6 +2933,12 @@ test "defaultModelForProvider gemini via alias" {
     try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("gemini"));
 }
 
+test "defaultModelForProvider vertex aliases" {
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex"));
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex-ai"));
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("google-vertex"));
+}
+
 test "defaultModelForProvider groq" {
     try std.testing.expectEqualStrings("llama-3.3-70b-versatile", defaultModelForProvider("groq"));
 }
@@ -2933,6 +2951,12 @@ test "providerEnvVar gemini aliases" {
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google-gemini"));
+}
+
+test "providerEnvVar vertex aliases" {
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex"));
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex-ai"));
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("google-vertex"));
 }
 
 test "providerEnvVar deepseek" {
@@ -3074,7 +3098,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 32);
+    try std.testing.expect(known_providers.len == 33);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -3190,6 +3214,8 @@ test "fallbackModelsForProvider returns models for known providers" {
 
     const gemini_models = fallbackModelsForProvider("gemini");
     try std.testing.expect(gemini_models.len >= 2);
+    const vertex_models = fallbackModelsForProvider("vertex");
+    try std.testing.expect(vertex_models.len >= 2);
 
     const claude_cli_models = fallbackModelsForProvider("claude-cli");
     try std.testing.expect(claude_cli_models.len >= 1);
@@ -3204,6 +3230,10 @@ test "fallbackModelsForProvider handles aliases" {
     const models = fallbackModelsForProvider("google");
     try std.testing.expect(models.len >= 2);
     try std.testing.expectEqualStrings("gemini-2.5-pro", models[0]);
+
+    const vertex_models = fallbackModelsForProvider("vertex-ai");
+    try std.testing.expect(vertex_models.len >= 2);
+    try std.testing.expectEqualStrings("gemini-2.5-pro", vertex_models[0]);
 }
 
 test "fallbackModelsForProvider unknown returns anthropic fallback" {

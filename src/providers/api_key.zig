@@ -66,6 +66,9 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
         .{ "google", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
         .{ "google-gemini", .{ "GEMINI_API_KEY", "GOOGLE_API_KEY", "" } },
+        .{ "vertex", .{ "VERTEX_API_KEY", "VERTEX_OAUTH_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN" } },
+        .{ "vertex-ai", .{ "VERTEX_API_KEY", "VERTEX_OAUTH_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN" } },
+        .{ "google-vertex", .{ "VERTEX_API_KEY", "VERTEX_OAUTH_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN" } },
         .{ "groq", .{ "GROQ_API_KEY", "", "" } },
         .{ "mistral", .{ "MISTRAL_API_KEY", "", "" } },
         .{ "deepseek", .{ "DEEPSEEK_API_KEY", "", "" } },
@@ -152,6 +155,11 @@ test "NVIDIA_API_KEY env resolves nvidia credential" {
 test "astrai env candidate is ASTRAI_API_KEY" {
     const candidates = providerEnvCandidates("astrai");
     try std.testing.expectEqualStrings("ASTRAI_API_KEY", candidates[0]);
+}
+
+test "vertex env candidate is VERTEX_API_KEY" {
+    const candidates = providerEnvCandidates("vertex");
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", candidates[0]);
 }
 
 test "providerEnvCandidates includes onboarding env hints" {

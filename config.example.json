@@ -5,6 +5,15 @@
     "providers": {
       "openrouter": {
         "api_key": "YOUR_OPENROUTER_API_KEY"
+      },
+      "vertex": {
+        "api_key": {
+          "type": "service_account",
+          "project_id": "YOUR_GCP_PROJECT",
+          "client_email": "YOUR_SERVICE_ACCOUNT_EMAIL",
+          "private_key": "-----BEGIN PRIVATE KEY-----\\nYOUR_PRIVATE_KEY\\n-----END PRIVATE KEY-----\\n"
+        },
+        "base_url": "https://aiplatform.googleapis.com/v1/projects/YOUR_GCP_PROJECT/locations/global/publishers/google/models"
       }
     }
   },
@@ -114,6 +123,7 @@
       "hygiene_enabled": true,
       "archive_after_days": 7,
       "purge_after_days": 30,
+      "preserve_before_purge": true,
       "conversation_retention_days": 30,
       "snapshot_enabled": false,
       "snapshot_on_hygiene": false,
@@ -176,7 +186,8 @@
   "autonomy": {
     "level": "supervised",
     "workspace_only": true,
-    "max_actions_per_hour": 20
+    "max_actions_per_hour": 20,
+    "allow_raw_url_chars": false
   },
 
   "gateway": {

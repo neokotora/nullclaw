@@ -208,6 +208,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+        .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
         .tracker = &tracker,
     };
 

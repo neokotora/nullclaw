@@ -36,6 +36,10 @@ pub const SandboxBackend = enum {
 
 pub const ProviderEntry = struct {
     name: []const u8,
+    /// Provider credential payload.
+    /// Usually a string API key/token.
+    /// For providers that support structured credentials (e.g. Vertex service-account JSON),
+    /// the parser accepts object/array JSON and stores it as a compact JSON string.
     api_key: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
@@ -95,6 +99,9 @@ pub const AutonomyConfig = struct {
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     allowed_commands: []const []const u8 = &.{},
+    /// When true, skip the single-`&` shell-operator check so that bare
+    /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
+    allow_raw_url_chars: bool = false,
     /// Additional directories (absolute paths) the agent may access beyond workspace_dir.
     /// Resolved via realpath at check time; system-critical paths are always blocked.
     allowed_paths: []const []const u8 = &.{},
@@ -139,6 +146,32 @@ pub const SchedulerConfig = struct {
     agent_timeout_secs: u64 = 0,
 };
 
+// ── Tool filter groups ──────────────────────────────────────────
+
+/// Controls which MCP tools are included in the schema sent to the LLM each turn.
+///
+/// Two modes:
+///   - `always`:  tools matching `tools` patterns are always included (no keywords needed).
+///   - `dynamic`: tools matching `tools` patterns are included only when the user message
+///                contains at least one of the `keywords` (case-insensitive substring match).
+///
+/// Built-in (non-MCP) tools are always included regardless of filter groups.
+/// If no filter groups are configured, all tools pass through unchanged.
+pub const ToolFilterGroupMode = enum {
+    always,
+    dynamic,
+};
+
+pub const ToolFilterGroup = struct {
+    mode: ToolFilterGroupMode,
+    /// Glob patterns matched against tool names (e.g. "mcp_vikunja_*").
+    /// Supports `*` wildcard only (prefix/suffix/infix).
+    tools: []const []const u8 = &.{},
+    /// Keywords for `dynamic` mode — case-insensitive substring match against user message.
+    /// Ignored when mode is `always`.
+    keywords: []const []const u8 = &.{},
+};
+
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 1000,
@@ -157,6 +190,9 @@ pub const AgentConfig = struct {
     status_show_emojis: bool = true,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 600,
+    /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
+    /// See ToolFilterGroup for semantics.
+    tool_filter_groups: []const ToolFilterGroup = &.{},
 };
 
 pub const ToolsConfig = struct {
@@ -906,6 +942,7 @@ pub const MemoryLifecycleConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
+    preserve_before_purge: bool = true,
     conversation_retention_days: u32 = 30,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
@@ -1322,6 +1359,7 @@ test "security defaults stay least-privilege" {
     try std.testing.expectEqual(@as(u32, 20), autonomy.max_actions_per_hour);
     try std.testing.expect(autonomy.require_approval_for_medium_risk);
     try std.testing.expect(autonomy.block_high_risk_commands);
+    try std.testing.expect(!autonomy.allow_raw_url_chars);
 
     const http_request = HttpRequestConfig{};
     try std.testing.expect(!http_request.enabled);

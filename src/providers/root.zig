@@ -7,6 +7,7 @@ pub const anthropic = @import("anthropic.zig");
 pub const openai = @import("openai.zig");
 pub const ollama = @import("ollama.zig");
 pub const gemini = @import("gemini.zig");
+pub const vertex = @import("vertex.zig");
 pub const openrouter = @import("openrouter.zig");
 pub const compatible = @import("compatible.zig");
 pub const reliable = @import("reliable.zig");
@@ -49,11 +50,14 @@ pub const buildRequestBody = helpers.buildRequestBody;
 pub const buildRequestBodyWithSystem = helpers.buildRequestBodyWithSystem;
 pub const isReasoningModel = helpers.isReasoningModel;
 pub const appendGenerationFields = helpers.appendGenerationFields;
+pub const appendGeminiThinkingConfig = helpers.appendGeminiThinkingConfig;
+pub const appendVertexThinkingConfig = helpers.appendVertexThinkingConfig;
 pub const convertToolsOpenAI = helpers.convertToolsOpenAI;
 pub const serializeMessageContent = helpers.serializeMessageContent;
 pub const serializeContentPart = helpers.serializeContentPart;
 pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const curlPostTimed = helpers.curlPostTimed;
+pub const curlPostFormTimed = helpers.curlPostFormTimed;
 pub const extractContent = helpers.extractContent;
 
 // Direct re-exports from utility modules

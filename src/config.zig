@@ -40,6 +40,8 @@ pub const ModelFallbackEntry = config_types.ModelFallbackEntry;
 pub const ReliabilityConfig = config_types.ReliabilityConfig;
 pub const SchedulerConfig = config_types.SchedulerConfig;
 pub const AgentConfig = config_types.AgentConfig;
+pub const ToolFilterGroup = config_types.ToolFilterGroup;
+pub const ToolFilterGroupMode = config_types.ToolFilterGroupMode;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
 pub const HeartbeatConfig = config_types.HeartbeatConfig;
 pub const CronConfig = config_types.CronConfig;
@@ -2491,6 +2493,16 @@ test "json parse autonomy allowed_paths" {
     allocator.free(cfg.autonomy.allowed_paths);
 }
 
+test "json parse autonomy allow_raw_url_chars" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"allow_raw_url_chars": true}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.autonomy.allow_raw_url_chars);
+}
+
 test "json parse gateway paired tokens" {
     const allocator = std.testing.allocator;
     const json =
@@ -3029,6 +3041,33 @@ test "json parse providers section" {
     try std.testing.expectEqualStrings("https://custom.groq.dev", cfg.getProviderBaseUrl("groq").?);
     try std.testing.expect(cfg.getProviderBaseUrl("openrouter") == null);
     // Cleanup
+    for (cfg.providers) |e| {
+        allocator.free(e.name);
+        if (e.api_key) |k| allocator.free(k);
+        if (e.base_url) |b| allocator.free(b);
+        if (e.user_agent) |ua| allocator.free(ua);
+    }
+    allocator.free(cfg.providers);
+}
+
+test "json parse providers section accepts object api_key" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"models":{"providers":{"vertex":{"api_key":{"type":"service_account","project_id":"proj-obj","client_email":"svc@proj-obj.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\\n"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    const key = cfg.getProviderKey("vertex") orelse return error.TestExpectedEqual;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, key, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("service_account", obj.get("type").?.string);
+    try std.testing.expectEqualStrings("proj-obj", obj.get("project_id").?.string);
+    try std.testing.expectEqualStrings("svc@proj-obj.iam.gserviceaccount.com", obj.get("client_email").?.string);
+
     for (cfg.providers) |e| {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
@@ -3800,6 +3839,28 @@ test "json parse reasoning_effort low" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("low", cfg.reasoning_effort.?);
+    allocator.free(cfg.reasoning_effort.?);
+}
+
+test "json parse reasoning_effort minimal" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"reasoning_effort": "minimal"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("minimal", cfg.reasoning_effort.?);
+    allocator.free(cfg.reasoning_effort.?);
+}
+
+test "json parse reasoning_effort xhigh" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"reasoning_effort": "xhigh"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("xhigh", cfg.reasoning_effort.?);
     allocator.free(cfg.reasoning_effort.?);
 }
 

@@ -18,8 +18,20 @@
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
 ```
-678 KB binary · <2 ms startup · 3,230+ tests · 22+ providers · 18 channels · Pluggable everything
+678 KB binary · <2 ms startup · 3,230+ tests · 23+ providers · 18 channels · Pluggable everything
 ```
+
+## 中文文档
+
+- [中文文档总览](docs/zh/README.md)
+- [安装指南](docs/zh/installation.md)
+- [配置指南](docs/zh/configuration.md)
+- [使用与运维](docs/zh/usage.md)
+- [架构总览](docs/zh/architecture.md)
+- [安全机制](docs/zh/security.md)
+- [Gateway API](docs/zh/gateway-api.md)
+- [命令参考](docs/zh/commands.md)
+- [开发指南](docs/zh/development.md)
 
 ### Features
 
@@ -27,7 +39,7 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 22+ providers, 18 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 23+ providers, 18 channels, 18+ tools, hybrid vector+FTS5 memory, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
 ### Why nullclaw
 
@@ -170,7 +182,7 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
-| **AI Models** | `Provider` | 22+ providers (OpenRouter, Anthropic, OpenAI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
+| **AI Models** | `Provider` | 23+ providers (OpenRouter, Anthropic, OpenAI, Gemini, Vertex AI, Ollama, Venice, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, etc.) | `custom:https://your-api.com` — any OpenAI-compatible API |
 | **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown | Any persistence backend |
 | **Tools** | `Tool` | shell, file_read, file_write, file_edit, memory_store, memory_recall, memory_forget, browser_open, screenshot, composio, http_request, hardware_info, hardware_memory, pushover, and more | Any capability |
@@ -262,6 +274,13 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 
 > **OpenClaw compatible:** nullclaw uses the same config structure as [OpenClaw](https://github.com/openclaw/openclaw) (snake_case). Providers live under `models.providers`, the default model under `agents.defaults.model.primary`, and channels use `accounts` wrappers.
 > Top-level `default_provider` / `default_model` keys are not supported.
+>
+> **Vertex AI note:** `models.providers.vertex.api_key` supports either:
+> 1. a bearer token (`ya29...`), or
+> 2. a full Google service-account JSON object (same shape as Apps Script `GEMINI_KEY` with `project_id`, `client_email`, `private_key`).
+>
+> `models.providers.vertex.base_url` can be set explicitly (`.../projects/<id>/locations/<loc>/publishers/google/models`), or omitted when service-account JSON is used (nullclaw will derive it from `project_id`, with `VERTEX_LOCATION` defaulting to `global`).
+> Service-account mode requires `openssl` available in `$PATH` for RS256 JWT signing.
 
 ```json
 {
@@ -271,6 +290,15 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
     "providers": {
       "openrouter": { "api_key": "sk-or-..." },
       "groq": { "api_key": "gsk_..." },
+      "vertex": {
+        "api_key": {
+          "type": "service_account",
+          "project_id": "your-project",
+          "client_email": "svc@your-project.iam.gserviceaccount.com",
+          "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+        },
+        "base_url": "https://aiplatform.googleapis.com/v1/projects/your-project/locations/global/publishers/google/models"
+      },
       "anthropic": { "api_key": "sk-ant-...", "base_url": "https://api.anthropic.com" }
     }
   },
@@ -572,7 +600,7 @@ src/
   daemon.zig            Daemon supervisor with exponential backoff
   gateway.zig           HTTP gateway (rate limiting, idempotency, pairing)
   channels/             19 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
-  providers/            22+ AI provider implementations
+  providers/            23+ AI provider implementations
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
   tools/                18 tool implementations
   security/             Secrets (ChaCha20), sandbox backends (landlock, firejail, ...)

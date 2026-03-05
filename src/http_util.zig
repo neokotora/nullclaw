@@ -27,12 +27,43 @@ pub fn curlPostWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
-    return curlRequestWithProxy(allocator, "POST", url, body, headers, proxy, max_time);
+    return curlRequestWithProxy(
+        allocator,
+        "POST",
+        "Content-Type: application/json",
+        url,
+        body,
+        headers,
+        proxy,
+        max_time,
+    );
+}
+
+/// HTTP POST with application/x-www-form-urlencoded body via curl subprocess,
+/// with optional proxy and timeout.
+pub fn curlPostFormWithProxy(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    proxy: ?[]const u8,
+    max_time: ?[]const u8,
+) ![]u8 {
+    return curlRequestWithProxy(
+        allocator,
+        "POST",
+        "Content-Type: application/x-www-form-urlencoded",
+        url,
+        body,
+        &.{},
+        proxy,
+        max_time,
+    );
 }
 
 fn curlRequestWithProxy(
     allocator: Allocator,
     method: []const u8,
+    content_type_header: []const u8,
     url: []const u8,
     body: []const u8,
     headers: []const []const u8,
@@ -52,7 +83,7 @@ fn curlRequestWithProxy(
     argc += 1;
     argv_buf[argc] = "-H";
     argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
+    argv_buf[argc] = content_type_header;
     argc += 1;
 
     if (proxy) |p| {
@@ -143,73 +174,7 @@ pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers
 /// `body` must already be percent-encoded form data (e.g. `"key=val&key2=val2"`).
 /// Returns the response body. Caller owns returned memory.
 pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]u8 {
-    var argv_buf: [10][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/x-www-form-urlencoded";
-    argc += 1;
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    try child.spawn();
-
-    if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch {
-            stdin_file.close();
-            child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            return error.CurlWriteError;
-        };
-        stdin_file.close();
-        child.stdin = null;
-    } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlWriteError;
-    }
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return error.CurlReadError;
-    };
-
-    const term = child.wait() catch {
-        allocator.free(stdout);
-        return error.CurlWaitError;
-    };
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-    }
-
-    return stdout;
+    return curlPostFormWithProxy(allocator, url, body, null, null);
 }
 
 /// HTTP POST via curl subprocess and include HTTP status code in response.
@@ -307,7 +272,16 @@ pub fn curlPostWithStatus(
 
 /// HTTP PUT via curl subprocess (no proxy, no timeout).
 pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
-    return curlRequestWithProxy(allocator, "PUT", url, body, headers, null, null);
+    return curlRequestWithProxy(
+        allocator,
+        "PUT",
+        "Content-Type: application/json",
+        url,
+        body,
+        headers,
+        null,
+        null,
+    );
 }
 
 /// HTTP GET via curl subprocess with optional proxy.

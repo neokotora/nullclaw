@@ -20,6 +20,14 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
+fn parseApiKeyField(allocator: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
+    return switch (value) {
+        .string => |s| try allocator.dupe(u8, s),
+        .object, .array => try std.json.Stringify.valueAlloc(allocator, value, .{}),
+        else => null,
+    };
+}
+
 fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
     // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
     if (std.mem.startsWith(u8, primary, "custom:")) {
@@ -344,9 +352,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     }
     if (root.get("reasoning_effort")) |v| {
         if (v == .string) {
-            if (std.mem.eql(u8, v.string, "low") or
+            if (std.mem.eql(u8, v.string, "minimal") or
+                std.mem.eql(u8, v.string, "low") or
                 std.mem.eql(u8, v.string, "medium") or
                 std.mem.eql(u8, v.string, "high") or
+                std.mem.eql(u8, v.string, "xhigh") or
                 std.mem.eql(u8, v.string, "none"))
             {
                 self.reasoning_effort = try self.allocator.dupe(u8, v.string);
@@ -628,6 +638,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("allowed_commands")) |v| {
                 if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
             }
+            if (aut.object.get("allow_raw_url_chars")) |v| {
+                if (v == .bool) self.autonomy.allow_raw_url_chars = v.bool;
+            }
             // forbidden_paths: ignored (removed — path security handled by path_security.zig)
             if (aut.object.get("allowed_paths")) |v| {
                 if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
@@ -806,6 +819,35 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
+            }
+            // tool_filter_groups: array of { mode, tools, keywords? }
+            if (ag.object.get("tool_filter_groups")) |fg_val| {
+                if (fg_val == .array) {
+                    var fg_list: std.ArrayListUnmanaged(types.ToolFilterGroup) = .empty;
+                    for (fg_val.array.items) |item| {
+                        if (item != .object) continue;
+                        const mode_val = item.object.get("mode") orelse continue;
+                        if (mode_val != .string) continue;
+                        const mode: types.ToolFilterGroupMode = if (std.mem.eql(u8, mode_val.string, "always"))
+                            .always
+                        else if (std.mem.eql(u8, mode_val.string, "dynamic"))
+                            .dynamic
+                        else
+                            continue;
+
+                        var fg = types.ToolFilterGroup{ .mode = mode };
+
+                        if (item.object.get("tools")) |tv| {
+                            if (tv == .array) fg.tools = try parseStringArray(self.allocator, tv.array);
+                        }
+                        if (item.object.get("keywords")) |kv| {
+                            if (kv == .array) fg.keywords = try parseStringArray(self.allocator, kv.array);
+                        }
+
+                        try fg_list.append(self.allocator, fg);
+                    }
+                    self.agent.tool_filter_groups = try fg_list.toOwnedSlice(self.allocator);
+                }
             }
         }
     }
@@ -1199,6 +1241,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     };
                     if (lc.get("purge_after_days")) |v| if (v == .integer) {
                         self.memory.lifecycle.purge_after_days = @intCast(v.integer);
+                    };
+                    if (lc.get("preserve_before_purge")) |v| if (v == .bool) {
+                        self.memory.lifecycle.preserve_before_purge = v.bool;
                     };
                     if (lc.get("conversation_retention_days")) |v| if (v == .integer) {
                         self.memory.lifecycle.conversation_retention_days = @intCast(v.integer);
@@ -1661,7 +1706,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             .name = try self.allocator.dupe(u8, prov_name),
                         };
                         if (val.object.get("api_key")) |ak| {
-                            if (ak == .string) pe.api_key = try self.allocator.dupe(u8, ak.string);
+                            pe.api_key = try parseApiKeyField(self.allocator, ak);
                         }
                         if (val.object.get("base_url")) |ab| {
                             if (ab == .string) pe.base_url = try self.allocator.dupe(u8, ab.string);

@@ -58,6 +58,7 @@ pub const TaskRunRequest = struct {
     max_actions_per_hour: u32,
     require_approval_for_medium_risk: bool,
     block_high_risk_commands: bool,
+    allow_raw_url_chars: bool,
     configured_providers: []const config_types.ProviderEntry,
 };
 
@@ -98,6 +99,7 @@ pub const SubagentManager = struct {
     max_actions_per_hour: u32,
     require_approval_for_medium_risk: bool,
     block_high_risk_commands: bool,
+    allow_raw_url_chars: bool,
     configured_providers: []const config_types.ProviderEntry,
     http_enabled: bool,
     http_allowed_domains: []const []const u8,
@@ -131,6 +133,7 @@ pub const SubagentManager = struct {
             .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
             .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
             .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+            .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
             .configured_providers = cfg.providers,
             .http_enabled = cfg.http_request.enabled,
             .http_allowed_domains = cfg.http_request.allowed_domains,
@@ -384,6 +387,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .max_actions_per_hour = ctx.manager.max_actions_per_hour,
             .require_approval_for_medium_risk = ctx.manager.require_approval_for_medium_risk,
             .block_high_risk_commands = ctx.manager.block_high_risk_commands,
+            .allow_raw_url_chars = ctx.manager.allow_raw_url_chars,
             .configured_providers = ctx.manager.configured_providers,
         };
 

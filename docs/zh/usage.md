@@ -1,0 +1,138 @@
+# 使用与运维
+
+本页聚焦日常操作、服务化运行和常见故障排查。
+
+## 首次启动流程
+
+1. 执行初始化：
+
+```bash
+nullclaw onboard --interactive
+```
+
+2. 发送一条测试消息：
+
+```bash
+nullclaw agent -m "你好，nullclaw"
+```
+
+3. 启动长期运行网关：
+
+```bash
+nullclaw gateway
+```
+
+## 常用命令速查
+
+| 命令 | 用途 |
+|---|---|
+| `nullclaw onboard --api-key sk-... --provider openrouter` | 快速写入 provider 与 API Key |
+| `nullclaw onboard --interactive` | 交互式完整初始化 |
+| `nullclaw onboard --channels-only` | 只重配 channel / allowlist |
+| `nullclaw agent -m "..."` | 单条消息模式 |
+| `nullclaw agent` | 交互会话模式 |
+| `nullclaw gateway` | 启动长期运行 runtime（默认 `127.0.0.1:3000`） |
+| `nullclaw service install` | 安装后台服务 |
+| `nullclaw service start` | 启动后台服务 |
+| `nullclaw service status` | 查看后台服务状态 |
+| `nullclaw service stop` | 停止后台服务 |
+| `nullclaw service uninstall` | 卸载后台服务 |
+| `nullclaw doctor` | 系统诊断 |
+| `nullclaw status` | 全局状态 |
+| `nullclaw channel status` | 渠道健康状态 |
+| `nullclaw channel start telegram` | 启动指定渠道 |
+| `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw 数据 |
+| `nullclaw migrate openclaw` | 执行迁移 |
+
+## 服务化运行建议
+
+建议在长期运行场景使用 service 子命令：
+
+```bash
+nullclaw service install
+nullclaw service start
+nullclaw service status
+```
+
+如果配置改动较大，建议重启服务：
+
+```bash
+nullclaw service stop
+nullclaw service start
+```
+
+## 网关与配对（Pairing）
+
+- 默认网关地址：`127.0.0.1:3000`
+- 推荐保持 `gateway.require_pairing = true`
+- 建议通过 tunnel 暴露外网访问，不直接公网监听网关
+
+网关健康检查：
+
+```bash
+curl http://127.0.0.1:3000/health
+```
+
+## 常见问题（FAQ）
+
+### 1) 启动失败，提示配置错误
+
+处理步骤：
+
+1. 先跑 `nullclaw doctor` 看具体报错。
+2. 对照 `config.example.json` 检查字段拼写与层级。
+3. 检查 JSON 语法（逗号、引号、括号）。
+
+### 2) 模型调用失败（401/403）
+
+常见原因：
+
+- API Key 无效或过期。
+- provider 写错（例如填了 `openrouter` 但 key 属于其他平台）。
+- 模型路由字符串不匹配 provider。
+
+建议排查：
+
+```bash
+nullclaw status
+```
+
+并重新执行：
+
+```bash
+nullclaw onboard --interactive
+```
+
+### 3) 收不到渠道消息
+
+重点检查：
+
+- `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
+- `allow_from` 是否误设为空数组。
+- `nullclaw channel status` 是否有 unhealthy 标记。
+
+### 4) 网关启动但外部不可访问
+
+常见原因：
+
+- 仍绑定在 `127.0.0.1`。
+- 未配置 tunnel 或反向代理。
+- 防火墙未放行端口。
+
+## 变更后回归检查清单
+
+每次改配置后，建议按顺序执行：
+
+```bash
+nullclaw doctor
+nullclaw status
+nullclaw channel status
+nullclaw agent -m "self-check"
+```
+
+对 gateway 场景，额外验证：
+
+```bash
+nullclaw gateway
+curl http://127.0.0.1:3000/health
+```

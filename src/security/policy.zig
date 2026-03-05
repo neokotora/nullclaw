@@ -68,6 +68,9 @@ pub const SecurityPolicy = struct {
     max_actions_per_hour: u32 = 20,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
+    /// When true, skip the single-`&` check entirely so that bare
+    /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
+    allow_raw_url_chars: bool = false,
     tracker: ?*RateTracker = null,
 
     /// Classify command risk level.
@@ -185,8 +188,10 @@ pub const SecurityPolicy = struct {
             }
         }
 
-        // Block single & background chaining (&& is allowed)
-        if (containsSingleAmpersand(command)) return false;
+        // Block single & background chaining (&& is allowed).
+        // allow_raw_url_chars bypasses this check entirely so that
+        // bare & in URLs like https://...?a=1&b=2 is permitted.
+        if (!self.allow_raw_url_chars and containsSingleAmpersand(command)) return false;
 
         // Block output redirections
         if (std.mem.indexOfScalar(u8, command, '>') != null) return false;
@@ -303,9 +308,34 @@ fn replacePair(buf: []u8, pat: *const [2]u8) void {
 /// Detect a single `&` operator (background/chain). `&&` is allowed.
 /// We treat any standalone `&` as unsafe because it enables background
 /// process chaining that can escape foreground timeout expectations.
+/// Quote-aware: `&` inside single or double quotes (e.g. URLs) is safe.
 fn containsSingleAmpersand(s: []const u8) bool {
     if (s.len == 0) return false;
+    var in_single_quote = false;
+    var in_double_quote = false;
+    var escaped = false;
     for (s, 0..) |b, i| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        // In shell parsing, backslash escapes the next character everywhere
+        // except inside single quotes.
+        if (b == '\\' and !in_single_quote) {
+            escaped = true;
+            continue;
+        }
+
+        if (b == '\'' and !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if (b == '"' and !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if (in_single_quote or in_double_quote) continue;
         if (b != '&') continue;
         const prev_is_amp = i > 0 and s[i - 1] == '&';
         const next_is_amp = i + 1 < s.len and s[i + 1] == '&';
@@ -1081,6 +1111,23 @@ test "containsSingleAmpersand detects correctly" {
     try std.testing.expect(!containsSingleAmpersand(""));
 }
 
+test "containsSingleAmpersand_skips_quoted_ampersands" {
+    // & inside double quotes is safe (not a shell operator)
+    try std.testing.expect(!containsSingleAmpersand("curl \"https://example.com?a=1&b=2\""));
+    // & inside single quotes is safe
+    try std.testing.expect(!containsSingleAmpersand("curl 'https://example.com?a=1&b=2'"));
+    // & outside quotes is still detected
+    try std.testing.expect(containsSingleAmpersand("curl https://example.com?a=1&b=2"));
+    // Mixed: & inside quotes safe, unquoted & detected
+    try std.testing.expect(containsSingleAmpersand("curl \"https://example.com?a=1&b=2\" & echo done"));
+    // Fully quoted URL with multiple & is safe
+    try std.testing.expect(!containsSingleAmpersand("curl \"https://api.example.com/search?q=test&page=1&limit=10\""));
+    // Escaped quote outside quotes must not start a quoted region.
+    try std.testing.expect(containsSingleAmpersand("echo \\\" & echo done"));
+    // Escaped ampersand is a literal character and must not be treated as operator.
+    try std.testing.expect(!containsSingleAmpersand("echo \\& literal"));
+}
+
 // ── Argument safety tests ───────────────────────────────────
 
 test "find -exec is blocked" {
@@ -1250,6 +1297,89 @@ test "validateCommandExecution rejects oversized command" {
     @memcpy(buf[0..3], "ls ");
     const result = p.validateCommandExecution(&buf, false);
     try std.testing.expectError(error.CommandNotAllowed, result);
+}
+
+// ── URL special chars (? and &) in commands ─────────────────────
+
+test "quoted_url_with_ampersand_passes_wildcard_allowlist" {
+    // Core bug scenario: curl with a quoted URL containing ? and &
+    // should pass when the allowlist is ["*"].
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    // Double-quoted URL: & is inside quotes so not a shell operator
+    try std.testing.expect(p.isCommandAllowed("curl \"https://api.example.com/search?q=test&page=1\""));
+    // Single-quoted URL
+    try std.testing.expect(p.isCommandAllowed("curl 'https://api.example.com/search?q=test&page=1'"));
+    // ? alone in a URL (no &) was never blocked for non-rm commands
+    try std.testing.expect(p.isCommandAllowed("curl \"https://example.com?key=value\""));
+}
+
+test "unquoted_url_with_ampersand_blocked_by_default" {
+    // Without quotes, bare & is ambiguous and treated as a shell operator
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(!p.isCommandAllowed("curl https://example.com?a=1&b=2"));
+}
+
+test "escaped_quote_does_not_mask_background_ampersand" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(!p.isCommandAllowed("echo \\\" & touch /tmp/pwned"));
+}
+
+test "allow_raw_url_chars_permits_bare_ampersand" {
+    // With allow_raw_url_chars enabled, bare & in URLs is allowed
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .allow_raw_url_chars = true,
+    };
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com?a=1&b=2"));
+    try std.testing.expect(p.isCommandAllowed("curl https://api.example.com/search?q=test&page=1&limit=10"));
+}
+
+test "allow_raw_url_chars_still_enforces_other_safety_checks" {
+    // allow_raw_url_chars only relaxes the & check; other guards remain
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .allow_raw_url_chars = true,
+    };
+    // Subshell injection still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl $(cat /etc/passwd)"));
+    // Backtick injection still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl `whoami`"));
+    // Output redirection still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl https://example.com > /tmp/out"));
+    // Process substitution still blocked
+    try std.testing.expect(!p.isCommandAllowed("curl <(echo evil)"));
+}
+
+test "allow_raw_url_chars_defaults_to_false" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.allow_raw_url_chars);
+}
+
+test "dash_G_workaround_avoids_special_chars" {
+    // Demonstrates that the -G approach (curl -G url -d key=val)
+    // never needed the fix because it avoids ? and & in the command
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(p.isCommandAllowed("curl -G \"https://api.example.com/search\" -d \"q=test\" -d \"page=1\""));
 }
 
 test "command at MAX_ANALYSIS_LEN minus one is still analyzed" {

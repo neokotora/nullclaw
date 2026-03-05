@@ -381,6 +381,7 @@ pub const ChannelRuntime = struct {
             .max_actions_per_hour = config.autonomy.max_actions_per_hour,
             .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
             .block_high_risk_commands = config.autonomy.block_high_risk_commands,
+            .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
             .tracker = policy_tracker,
         };
 
