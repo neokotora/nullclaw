@@ -11,6 +11,9 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEXT_MESSAGE_DEBOUNCE_SECS: u64 = 3;
+const LARGE_TEXT_CHAIN_DEBOUNCE_SECS: u64 = 8;
+const LARGE_TEXT_CHAIN_MIN_PARTS: usize = 4;
+const LARGE_TEXT_CHAIN_MIN_BYTES: usize = 16 * 1024;
 // Debounce medium+ chunks so rapid-fire split messages get coalesced.
 const TEXT_SPLIT_LIKELY_MIN_LEN: usize = 500;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
@@ -325,18 +328,54 @@ fn pendingTextLatestSeenForKey(
     return if (seen) latest else null;
 }
 
+const PendingTextChainStats = struct {
+    latest: u64,
+    parts: usize,
+    total_bytes: usize,
+};
+
+fn pendingTextChainStatsForKey(
+    id: []const u8,
+    sender: []const u8,
+    pending_messages: []const root.ChannelMessage,
+    received_at: []const u64,
+) ?PendingTextChainStats {
+    const n = @min(pending_messages.len, received_at.len);
+    var seen = false;
+    var latest: u64 = 0;
+    var parts: usize = 0;
+    var total_bytes: usize = 0;
+    for (0..n) |i| {
+        const msg = pending_messages[i];
+        if (!std.mem.eql(u8, msg.id, id) or !std.mem.eql(u8, msg.sender, sender)) continue;
+        if (!seen or received_at[i] > latest) latest = received_at[i];
+        seen = true;
+        parts += 1;
+        total_bytes += msg.content.len;
+    }
+    if (!seen) return null;
+    return .{ .latest = latest, .parts = parts, .total_bytes = total_bytes };
+}
+
+fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
+    if (parts >= LARGE_TEXT_CHAIN_MIN_PARTS or total_bytes >= LARGE_TEXT_CHAIN_MIN_BYTES) {
+        return LARGE_TEXT_CHAIN_DEBOUNCE_SECS;
+    }
+    return TEXT_MESSAGE_DEBOUNCE_SECS;
+}
+
 fn nextPendingTextDeadline(pending_messages: []const root.ChannelMessage, received_at: []const u64) ?u64 {
     const n = @min(pending_messages.len, received_at.len);
     var seen = false;
     var next_deadline: u64 = 0;
     for (0..n) |i| {
-        const latest = pendingTextLatestSeenForKey(
+        const stats = pendingTextChainStatsForKey(
             pending_messages[i].id,
             pending_messages[i].sender,
             pending_messages,
             received_at,
         ) orelse continue;
-        const deadline = latest + TEXT_MESSAGE_DEBOUNCE_SECS;
+        const deadline = stats.latest + textDebounceSecsForChain(stats.parts, stats.total_bytes);
         if (!seen or deadline < next_deadline) next_deadline = deadline;
         seen = true;
     }
@@ -1848,7 +1887,7 @@ pub const TelegramChannel = struct {
         var i: usize = 0;
         while (i < self.pending_text_messages.items.len) {
             const msg = self.pending_text_messages.items[i];
-            const latest = pendingTextLatestSeenForKey(
+            const stats = pendingTextChainStatsForKey(
                 msg.id,
                 msg.sender,
                 self.pending_text_messages.items,
@@ -1857,7 +1896,8 @@ pub const TelegramChannel = struct {
                 i += 1;
                 continue;
             };
-            if (now < latest + TEXT_MESSAGE_DEBOUNCE_SECS) {
+            const chain_debounce_secs = textDebounceSecsForChain(stats.parts, stats.total_bytes);
+            if (now < stats.latest + chain_debounce_secs) {
                 i += 1;
                 continue;
             }
@@ -2949,14 +2989,15 @@ fn shouldDebounceTextMessage(self: *const TelegramChannel, msg: root.ChannelMess
     if (msg.content.len >= TEXT_SPLIT_LIKELY_MIN_LEN) return true;
 
     // Only debounce follow-ups when they are part of a *recent* rapid-fire chain.
-    const latest = pendingTextLatestSeenForKey(
+    const stats = pendingTextChainStatsForKey(
         msg.id,
         msg.sender,
         self.pending_text_messages.items,
         self.pending_text_received_at.items,
     ) orelse return false;
     const now = root.nowEpochSecs();
-    return now <= latest + TEXT_MESSAGE_DEBOUNCE_SECS;
+    const chain_debounce_secs = textDebounceSecsForChain(stats.parts, stats.total_bytes);
+    return now <= stats.latest + chain_debounce_secs;
 }
 
 fn mergeConsecutiveMessages(
@@ -4336,6 +4377,12 @@ test "telegram shouldDebounceTextMessage catches real-world ~3.4k split chunk" {
     };
 
     try std.testing.expect(shouldDebounceTextMessage(&ch, msg));
+}
+
+test "telegram textDebounceSecsForChain extends window for large chains" {
+    try std.testing.expectEqual(@as(u64, TEXT_MESSAGE_DEBOUNCE_SECS), textDebounceSecsForChain(1, 900));
+    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(4, 900));
+    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(2, LARGE_TEXT_CHAIN_MIN_BYTES));
 }
 
 test "telegram shouldDebounceTextMessage debounces medium chunk (~900 bytes)" {
