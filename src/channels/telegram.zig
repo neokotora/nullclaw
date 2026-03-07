@@ -4,10 +4,13 @@ const root = @import("root.zig");
 const voice = @import("../voice.zig");
 const platform = @import("../platform.zig");
 const config_types = @import("../config_types.zig");
+const control_plane = @import("../control_plane.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const streaming = @import("../streaming.zig");
+const telegram_api = @import("telegram_api.zig");
 const telegram_draft_presenter = @import("telegram_draft_presenter.zig");
 const telegram_ingress = @import("telegram_ingress.zig");
+const telegram_update_ingress = @import("telegram_update_ingress.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -21,31 +24,7 @@ const LARGE_TEXT_CHAIN_MIN_BYTES: usize = telegram_ingress.LARGE_TEXT_CHAIN_MIN_
 const TEXT_SPLIT_LIKELY_MIN_LEN: usize = telegram_ingress.TEXT_SPLIT_LIKELY_MIN_LEN;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
-const TELEGRAM_BOT_COMMANDS_JSON =
-    \\{"commands":[
-    \\{"command":"start","description":"Start a conversation"},
-    \\{"command":"new","description":"Clear history, start fresh"},
-    \\{"command":"reset","description":"Alias for /new"},
-    \\{"command":"help","description":"Show available commands"},
-    \\{"command":"commands","description":"Alias for /help"},
-    \\{"command":"status","description":"Show model and stats"},
-    \\{"command":"whoami","description":"Show current session id"},
-    \\{"command":"model","description":"Switch model"},
-    \\{"command":"models","description":"Alias for /model"},
-    \\{"command":"think","description":"Set thinking level"},
-    \\{"command":"verbose","description":"Set verbose level"},
-    \\{"command":"reasoning","description":"Set reasoning output"},
-    \\{"command":"exec","description":"Set exec policy"},
-    \\{"command":"queue","description":"Set queue policy"},
-    \\{"command":"usage","description":"Set usage footer mode"},
-    \\{"command":"tts","description":"Set TTS mode"},
-    \\{"command":"memory","description":"Memory tools and diagnostics"},
-    \\{"command":"doctor","description":"Memory diagnostics quick check"},
-    \\{"command":"stop","description":"Stop active background task"},
-    \\{"command":"restart","description":"Restart current session"},
-    \\{"command":"compact","description":"Compact context now"}
-    \\]}
-;
+const TELEGRAM_BOT_COMMANDS_JSON = control_plane.TELEGRAM_BOT_COMMANDS_JSON;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Attachment Types
@@ -551,12 +530,17 @@ pub const TelegramChannel = struct {
         return "telegram";
     }
 
+    fn api(self: *const TelegramChannel) telegram_api.Client {
+        return .{
+            .allocator = self.allocator,
+            .bot_token = self.bot_token,
+            .proxy = self.proxy,
+        };
+    }
+
     /// Build the Telegram API URL for a method.
     pub fn apiUrl(self: *const TelegramChannel, buf: []u8, method: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
-        try w.print("https://api.telegram.org/bot{s}/{s}", .{ self.bot_token, method });
-        return fbs.getWritten();
+        return self.api().apiUrl(buf, method);
     }
 
     /// Build a sendMessage JSON body.
@@ -635,11 +619,7 @@ pub const TelegramChannel = struct {
     }
 
     pub fn healthCheck(self: *TelegramChannel) bool {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "getMe") catch return false;
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10") catch return false;
-        defer self.allocator.free(resp);
-        return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
+        return self.api().getMeOk();
     }
 
     const Utf16ByteRange = struct {
@@ -745,24 +725,9 @@ pub const TelegramChannel = struct {
     fn fetchBotUsername(self: *TelegramChannel) void {
         if (self.bot_username != null) return;
         if (builtin.is_test) return;
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "getMe") catch return;
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10") catch return;
-        defer self.allocator.free(resp);
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return;
-        defer parsed.deinit();
-        if (parsed.value.object.get("result")) |result| {
-            if (result.object.get("id")) |id_val| {
-                if (id_val == .integer) {
-                    self.bot_user_id = id_val.integer;
-                }
-            }
-            if (result.object.get("username")) |username_val| {
-                if (username_val == .string) {
-                    self.bot_username = self.allocator.dupe(u8, username_val.string) catch null;
-                }
-            }
-        }
+        const identity = self.api().fetchBotIdentity(self.allocator) orelse return;
+        self.bot_user_id = identity.user_id;
+        self.bot_username = identity.username;
     }
 
     /// Check if the bot should process this message based on mention requirements.
@@ -796,55 +761,24 @@ pub const TelegramChannel = struct {
 
     /// Register bot commands with Telegram so they appear in the "/" menu.
     pub fn setMyCommands(self: *TelegramChannel) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "setMyCommands") catch return;
-
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, TELEGRAM_BOT_COMMANDS_JSON, &.{}, self.proxy, "10") catch |err| {
+        self.api().setMyCommands(TELEGRAM_BOT_COMMANDS_JSON) catch |err| {
             log.warn("setMyCommands failed: {}", .{err});
             return;
         };
-        self.allocator.free(resp);
     }
 
     /// Disable webhook mode before polling, preserving queued updates.
     pub fn deleteWebhookKeepPending(self: *TelegramChannel) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "deleteWebhook") catch return;
-
-        const body = "{\"drop_pending_updates\":false}";
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, "10") catch |err| {
+        self.api().deleteWebhookKeepPending() catch |err| {
             log.warn("deleteWebhook failed: {}", .{err});
             return;
         };
-        self.allocator.free(resp);
     }
 
     /// Skip all pending updates accumulated while bot was offline.
     /// Fetches with offset=-1 to get only the latest update, then advances past it.
     pub fn dropPendingUpdates(self: *TelegramChannel) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "getUpdates") catch return;
-
-        const body = "{\"offset\":-1,\"timeout\":0}";
-        const resp_body = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, "10") catch return;
-        defer self.allocator.free(resp_body);
-
-        // Parse to extract the latest update_id and advance past it
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp_body, .{}) catch return;
-        defer parsed.deinit();
-        if (parsed.value != .object) return;
-
-        const result_val = parsed.value.object.get("result") orelse return;
-        if (result_val != .array) return;
-        const result_array = result_val.array.items;
-        for (result_array) |update| {
-            if (update != .object) continue;
-            if (update.object.get("update_id")) |uid| {
-                if (uid == .integer) {
-                    self.last_update_id = uid.integer + 1;
-                }
-            }
-        }
+        self.last_update_id = self.api().latestUpdateNextOffset(self.allocator) orelse return;
     }
 
     /// Return an offset safe to persist across restarts.
@@ -863,19 +797,7 @@ pub const TelegramChannel = struct {
     pub fn sendTypingIndicator(self: *TelegramChannel, chat_id: []const u8) void {
         if (builtin.is_test) return;
         if (chat_id.len == 0) return;
-
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "sendChatAction") catch return;
-
-        var body_list: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_list.deinit(self.allocator);
-
-        body_list.appendSlice(self.allocator, "{\"chat_id\":") catch return;
-        body_list.appendSlice(self.allocator, chat_id) catch return;
-        body_list.appendSlice(self.allocator, ",\"action\":\"typing\"}") catch return;
-
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "10") catch return;
-        self.allocator.free(resp);
+        self.api().sendTypingIndicator(chat_id) catch return;
     }
 
     pub fn startTyping(self: *TelegramChannel, chat_id: []const u8) !void {
@@ -966,9 +888,7 @@ pub const TelegramChannel = struct {
         }
     }
 
-    const SentMessageMeta = struct {
-        message_id: ?i64 = null,
-    };
+    const SentMessageMeta = telegram_api.SentMessageMeta;
 
     const CallbackSelectionResult = union(enum) {
         ok: struct {
@@ -987,41 +907,6 @@ pub const TelegramChannel = struct {
         token: []const u8,
         option_id: []const u8,
     };
-
-    fn appendReplyTo(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, reply_to: ?i64) !void {
-        if (reply_to) |rid| {
-            var rid_buf: [32]u8 = undefined;
-            const rid_str = std.fmt.bufPrint(&rid_buf, "{d}", .{rid}) catch unreachable;
-            try body.appendSlice(allocator, ",\"reply_parameters\":{\"message_id\":");
-            try body.appendSlice(allocator, rid_str);
-            try body.appendSlice(allocator, "}");
-        }
-    }
-
-    fn appendRawReplyMarkup(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, reply_markup_json: ?[]const u8) !void {
-        if (reply_markup_json) |rm| {
-            try body.appendSlice(allocator, ",\"reply_markup\":");
-            try body.appendSlice(allocator, rm);
-        }
-    }
-
-    fn responseHasTelegramError(resp: []const u8) bool {
-        return std.mem.indexOf(u8, resp, "\"error_code\"") != null or
-            std.mem.indexOf(u8, resp, "\"ok\":false") != null;
-    }
-
-    fn parseSentMessageMeta(allocator: std.mem.Allocator, resp: []const u8) ?SentMessageMeta {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
-        defer parsed.deinit();
-        if (parsed.value != .object) return null;
-        const ok_val = parsed.value.object.get("ok") orelse return null;
-        if (ok_val != .bool or !ok_val.bool) return null;
-        const result_val = parsed.value.object.get("result") orelse return null;
-        if (result_val != .object) return null;
-        const msg_id_val = result_val.object.get("message_id") orelse return .{};
-        if (msg_id_val != .integer) return .{};
-        return .{ .message_id = msg_id_val.integer };
-    }
 
     fn nextInteractionToken(self: *TelegramChannel) ![]u8 {
         const seq = self.interaction_seq.fetchAdd(1, .monotonic) + 1;
@@ -1236,40 +1121,11 @@ pub const TelegramChannel = struct {
     }
 
     fn answerCallbackQuery(self: *TelegramChannel, callback_query_id: []const u8, text: ?[]const u8) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "answerCallbackQuery") catch return;
-
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        body.appendSlice(self.allocator, "{\"callback_query_id\":") catch return;
-        root.json_util.appendJsonString(&body, self.allocator, callback_query_id) catch return;
-        if (text) |t| {
-            body.appendSlice(self.allocator, ",\"text\":") catch return;
-            root.json_util.appendJsonString(&body, self.allocator, t) catch return;
-        }
-        body.appendSlice(self.allocator, "}") catch return;
-
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, "10") catch return;
-        self.allocator.free(resp);
+        self.api().answerCallbackQuery(callback_query_id, text) catch return;
     }
 
     fn editMessageReplyMarkupClear(self: *TelegramChannel, chat_id: []const u8, message_id: i64) void {
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "editMessageReplyMarkup") catch return;
-
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
-        body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
-        body.appendSlice(self.allocator, chat_id) catch return;
-
-        var msg_id_buf: [32]u8 = undefined;
-        const msg_id_str = std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id}) catch return;
-        body.appendSlice(self.allocator, ",\"message_id\":") catch return;
-        body.appendSlice(self.allocator, msg_id_str) catch return;
-        body.appendSlice(self.allocator, ",\"reply_markup\":{\"inline_keyboard\":[]}}") catch return;
-
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, "10") catch return;
-        self.allocator.free(resp);
+        self.api().clearReplyMarkup(chat_id, message_id) catch return;
     }
 
     // ── HTML fallback ────────────────────────────────────────────────
@@ -1282,9 +1138,6 @@ pub const TelegramChannel = struct {
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "sendMessage");
-
         // Convert Markdown → Telegram HTML
         const html_text = markdownToTelegramHtml(self.allocator, text) catch {
             // Conversion failed — send as plain text
@@ -1301,23 +1154,23 @@ pub const TelegramChannel = struct {
         try html_body.appendSlice(self.allocator, ",\"text\":");
         try root.json_util.appendJsonString(&html_body, self.allocator, html_text);
         try html_body.appendSlice(self.allocator, ",\"parse_mode\":\"HTML\"");
-        try appendReplyTo(&html_body, self.allocator, reply_to);
-        try appendRawReplyMarkup(&html_body, self.allocator, reply_markup_json);
+        try telegram_api.appendReplyTo(&html_body, self.allocator, reply_to);
+        try telegram_api.appendRawReplyMarkup(&html_body, self.allocator, reply_markup_json);
         try html_body.appendSlice(self.allocator, "}");
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, html_body.items, &.{}, self.proxy, "30") catch {
+        const resp = self.api().sendMessage(self.allocator, html_body.items, "30") catch {
             // Network error — fall through to plain send
             return try self.sendChunkPlainWithMarkup(chat_id, text, reply_to, reply_markup_json);
         };
         defer self.allocator.free(resp);
 
         // Check if response indicates error (contains "error_code")
-        if (responseHasTelegramError(resp)) {
+        if (telegram_api.responseHasTelegramError(resp)) {
             // HTML failed, retry as plain text
             return try self.sendChunkPlainWithMarkup(chat_id, text, reply_to, reply_markup_json);
         }
 
-        return parseSentMessageMeta(self.allocator, resp) orelse .{};
+        return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse .{};
     }
 
     fn sendWithMarkdownFallback(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
@@ -1331,9 +1184,6 @@ pub const TelegramChannel = struct {
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "sendMessage");
-
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
 
@@ -1341,13 +1191,13 @@ pub const TelegramChannel = struct {
         try body_list.appendSlice(self.allocator, chat_id);
         try body_list.appendSlice(self.allocator, ",\"text\":");
         try root.json_util.appendJsonString(&body_list, self.allocator, text);
-        try appendReplyTo(&body_list, self.allocator, reply_to);
-        try appendRawReplyMarkup(&body_list, self.allocator, reply_markup_json);
+        try telegram_api.appendReplyTo(&body_list, self.allocator, reply_to);
+        try telegram_api.appendRawReplyMarkup(&body_list, self.allocator, reply_markup_json);
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "30");
+        const resp = try self.api().sendMessage(self.allocator, body_list.items, "30");
         defer self.allocator.free(resp);
-        return parseSentMessageMeta(self.allocator, resp) orelse .{};
+        return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse .{};
     }
 
     fn sendChunkPlain(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
@@ -1407,83 +1257,17 @@ pub const TelegramChannel = struct {
         file_path: []const u8,
         caption: ?[]const u8,
     ) !void {
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, kind.apiMethod());
         const resolved_file_path = try resolveAttachmentPath(allocator, file_path);
         defer resolved_file_path.deinit(allocator);
         const media_path = resolved_file_path.path;
-
-        // Build file form field: field=@path (local files) or field=URL (remote URLs)
-        var file_arg_buf: [1024]u8 = undefined;
-        var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
-        if (std.mem.startsWith(u8, media_path, "http://") or
-            std.mem.startsWith(u8, media_path, "https://"))
-        {
-            try file_fbs.writer().print("{s}={s}", .{ kind.formField(), media_path });
-        } else {
-            try file_fbs.writer().print("{s}=@{s}", .{ kind.formField(), media_path });
-        }
-        const file_arg = file_fbs.getWritten();
-
-        // Build chat_id form field
-        var chatid_arg_buf: [128]u8 = undefined;
-        var chatid_fbs = std.io.fixedBufferStream(&chatid_arg_buf);
-        try chatid_fbs.writer().print("chat_id={s}", .{chat_id});
-        const chatid_arg = chatid_fbs.getWritten();
-
-        // Build argv
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "120";
-        argc += 1;
-
-        if (self.proxy) |p| {
-            argv_buf[argc] = "-x";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = chatid_arg;
-        argc += 1;
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = file_arg;
-        argc += 1;
-
-        // Optional caption
-        var caption_arg_buf: [1024]u8 = undefined;
-        if (caption) |cap| {
-            var cap_fbs = std.io.fixedBufferStream(&caption_arg_buf);
-            try cap_fbs.writer().print("caption={s}", .{cap});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = cap_fbs.getWritten();
-            argc += 1;
-        }
-
-        argv_buf[argc] = url;
-        argc += 1;
-
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-
-        _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
-        }
+        try self.api().postMultipart(
+            allocator,
+            kind.apiMethod(),
+            chat_id,
+            kind.formField(),
+            media_path,
+            caption,
+        );
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -1611,10 +1395,6 @@ pub const TelegramChannel = struct {
     }
 
     fn sendChunk(self: *TelegramChannel, chat_id: []const u8, text: []const u8) !void {
-        // Build URL
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "sendMessage");
-
         // Build JSON body with escaped text
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
@@ -1625,8 +1405,179 @@ pub const TelegramChannel = struct {
         try root.json_util.appendJsonString(&body_list, self.allocator, text);
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try root.http_util.curlPostWithProxy(self.allocator, url, body_list.items, &.{}, self.proxy, "30");
+        const resp = try self.api().sendMessage(self.allocator, body_list.items, "30");
         self.allocator.free(resp);
+    }
+
+    fn advanceLastUpdateOffset(self: *TelegramChannel, update: std.json.Value) void {
+        const update_id = telegram_update_ingress.updateId(update) orelse return;
+        self.last_update_id = update_id + 1;
+    }
+
+    fn logUnauthorizedMessage(sender: telegram_update_ingress.UserIdentity) void {
+        log.warn("ignoring message from unauthorized user: username={s}, user_id={s}", .{
+            sender.username,
+            sender.user_id orelse "unknown",
+        });
+    }
+
+    fn logUnauthorizedCallback(sender: telegram_update_ingress.UserIdentity) void {
+        log.warn("ignoring callback from unauthorized user: username={s}, user_id={s}", .{
+            sender.username,
+            sender.user_id orelse "unknown",
+        });
+    }
+
+    fn buildVoiceContent(self: *TelegramChannel, allocator: std.mem.Allocator, file_id: []const u8) ?[]u8 {
+        const transcribed = voice.transcribeTelegramVoice(allocator, self.bot_token, file_id, self.transcriber) orelse return null;
+        defer allocator.free(transcribed);
+
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        result.appendSlice(allocator, "[Voice]: ") catch return null;
+        result.appendSlice(allocator, transcribed) catch {
+            result.deinit(allocator);
+            return null;
+        };
+        return result.toOwnedSlice(allocator) catch {
+            result.deinit(allocator);
+            return null;
+        };
+    }
+
+    fn appendOptionalCaption(result: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, message: std.json.Value) void {
+        const caption = telegram_update_ingress.caption(message) orelse return;
+        result.appendSlice(allocator, " ") catch return;
+        result.appendSlice(allocator, caption) catch return;
+    }
+
+    fn buildTaggedAttachmentContent(
+        allocator: std.mem.Allocator,
+        prefix: []const u8,
+        local_path: []const u8,
+        message: std.json.Value,
+    ) ?[]u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        result.appendSlice(allocator, prefix) catch return null;
+        result.appendSlice(allocator, local_path) catch {
+            result.deinit(allocator);
+            return null;
+        };
+        result.appendSlice(allocator, "]") catch {
+            result.deinit(allocator);
+            return null;
+        };
+        appendOptionalCaption(&result, allocator, message);
+        return result.toOwnedSlice(allocator) catch {
+            result.deinit(allocator);
+            return null;
+        };
+    }
+
+    fn resolveVoiceOrAudioContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
+        const file_id = telegram_update_ingress.voiceOrAudioFileId(message) orelse return null;
+        return self.buildVoiceContent(allocator, file_id);
+    }
+
+    fn resolvePhotoContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
+        const photo_fid = telegram_update_ingress.photoFileId(message) orelse return null;
+        const local_path = downloadTelegramPhoto(allocator, self.bot_token, photo_fid, self.proxy) orelse return null;
+        defer allocator.free(local_path);
+        return buildTaggedAttachmentContent(allocator, "[IMAGE:", local_path, message);
+    }
+
+    fn resolveDocumentContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
+        const doc = telegram_update_ingress.documentInfo(message) orelse return null;
+        const local_path = downloadTelegramFile(allocator, self.bot_token, doc.file_id, doc.file_name, self.proxy) orelse return null;
+        defer allocator.free(local_path);
+        return buildTaggedAttachmentContent(allocator, "[FILE:", local_path, message);
+    }
+
+    fn resolveMessageContent(self: *TelegramChannel, allocator: std.mem.Allocator, message: std.json.Value) ?[]u8 {
+        return self.resolveVoiceOrAudioContent(allocator, message) orelse
+            self.resolvePhotoContent(allocator, message) orelse
+            self.resolveDocumentContent(allocator, message) orelse
+            telegram_update_ingress.textOrCaption(allocator, message);
+    }
+
+    fn appendIncomingMessage(
+        allocator: std.mem.Allocator,
+        messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+        media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
+        sender: telegram_update_ingress.UserIdentity,
+        chat: telegram_update_ingress.ChatContext,
+        final_content: []u8,
+    ) void {
+        const id_dup = allocator.dupe(u8, sender.preferred_identity) catch {
+            allocator.free(final_content);
+            return;
+        };
+        const sender_dup = allocator.dupe(u8, chat.chat_id) catch {
+            allocator.free(final_content);
+            allocator.free(id_dup);
+            return;
+        };
+        const fn_dup: ?[]const u8 = if (sender.first_name) |fn_|
+            (allocator.dupe(u8, fn_) catch {
+                allocator.free(final_content);
+                allocator.free(id_dup);
+                allocator.free(sender_dup);
+                return;
+            })
+        else
+            null;
+
+        messages.append(allocator, .{
+            .id = id_dup,
+            .sender = sender_dup,
+            .content = final_content,
+            .channel = "telegram",
+            .timestamp = root.nowEpochSecs(),
+            .message_id = chat.message_id,
+            .first_name = fn_dup,
+            .is_group = chat.is_group,
+        }) catch {
+            allocator.free(final_content);
+            allocator.free(id_dup);
+            allocator.free(sender_dup);
+            if (fn_dup) |f| allocator.free(f);
+            return;
+        };
+
+        const mg_dup: ?[]const u8 = if (chat.media_group_id) |mgid|
+            (allocator.dupe(u8, mgid) catch null)
+        else
+            null;
+        media_group_ids.append(allocator, mg_dup) catch {
+            const popped = messages.pop().?;
+            var tmp = popped;
+            tmp.deinit(allocator);
+            if (mg_dup) |m| allocator.free(m);
+        };
+    }
+
+    fn processMessageUpdate(
+        self: *TelegramChannel,
+        allocator: std.mem.Allocator,
+        message: std.json.Value,
+        messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+        media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
+    ) void {
+        var scratch: telegram_update_ingress.IdentityScratch = .{};
+        const sender = telegram_update_ingress.messageSender(message, &scratch) orelse return;
+        const chat = telegram_update_ingress.messageChatContext(message, &scratch) orelse return;
+
+        if (!self.isAuthorizedIdentity(chat.is_group, sender.username, sender.user_id)) {
+            logUnauthorizedMessage(sender);
+            return;
+        }
+
+        if (!self.shouldProcessMessage(message)) {
+            log.info("ignoring message: require_mention enabled but bot not mentioned", .{});
+            return;
+        }
+
+        const final_content = self.resolveMessageContent(allocator, message) orelse return;
+        appendIncomingMessage(allocator, messages, media_group_ids, sender, chat, final_content);
     }
 
     fn resetPendingMediaBuffers(self: *TelegramChannel) void {
@@ -1875,9 +1826,6 @@ pub const TelegramChannel = struct {
     /// Voice and audio messages are automatically transcribed via Groq Whisper
     /// when a Groq API key is configured (config or GROQ_API_KEY env var).
     pub fn pollUpdates(self: *TelegramChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
-        var url_buf: [512]u8 = undefined;
-        const url = try self.apiUrl(&url_buf, "getUpdates");
-
         self.maybeSweepTempMediaFiles();
         self.cleanupExpiredInteractions();
 
@@ -1909,7 +1857,7 @@ pub const TelegramChannel = struct {
         var timeout_buf: [16]u8 = undefined;
         const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{poll_timeout + 15}) catch "45";
 
-        const resp_body = try root.http_util.curlPostWithProxy(allocator, url, body, &.{}, self.proxy, timeout_str);
+        const resp_body = try self.api().getUpdates(allocator, body, timeout_str);
         defer allocator.free(resp_body);
 
         // Parse JSON response to extract messages
@@ -2483,10 +2431,7 @@ pub const TelegramChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         // Verify bot token by calling getMe
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "getMe") catch return;
-
-        if (root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10")) |resp| {
+        if (self.api().getMe(self.allocator)) |resp| {
             self.allocator.free(resp);
         } else |_| {}
 
@@ -2525,9 +2470,6 @@ pub const TelegramChannel = struct {
         if (builtin.is_test) return;
         if (!telegram_draft_presenter.hasVisibleDraftText(text)) return;
 
-        var url_buf: [512]u8 = undefined;
-        const url = self.apiUrl(&url_buf, "sendMessageDraft") catch return;
-
         // Try HTML conversion, fall back to plain text.
         const html_text = markdownToTelegramHtml(self.allocator, text) catch null;
         defer if (html_text) |h| self.allocator.free(h);
@@ -2550,13 +2492,13 @@ pub const TelegramChannel = struct {
         }
         body.appendSlice(self.allocator, "}") catch return;
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, "10") catch |err| {
+        const resp = self.api().sendMessageDraft(self.allocator, body.items) catch |err| {
             log.warn("sendMessageDraft request failed: {}", .{err});
             return;
         };
         defer self.allocator.free(resp);
 
-        if (responseHasTelegramError(resp)) {
+        if (telegram_api.responseHasTelegramError(resp)) {
             log.warn("sendMessageDraft API error: {s}", .{resp[0..@min(resp.len, 256)]});
         }
     }
@@ -3011,49 +2953,18 @@ fn mergeMediaGroups(
 
 /// Download a photo from Telegram by file_id. Returns the local temp file path (caller-owned).
 fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8, proxy: ?[]const u8) ?[]u8 {
-    // 1. Call getFile to get file_path
-    var url_buf: [512]u8 = undefined;
-    var url_fbs = std.io.fixedBufferStream(&url_buf);
-    url_fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token}) catch return null;
-    const api_url = url_fbs.getWritten();
-
-    var body_list: std.ArrayListUnmanaged(u8) = .empty;
-    defer body_list.deinit(allocator);
-    body_list.appendSlice(allocator, "{\"file_id\":") catch return null;
-    root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
-    body_list.appendSlice(allocator, "}") catch return null;
-
-    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, "15") catch |err| {
+    const api_client = telegram_api.Client{
+        .allocator = allocator,
+        .bot_token = bot_token,
+        .proxy = proxy,
+    };
+    const tg_file_path = api_client.getFilePath(allocator, file_id) catch |err| {
         log.warn("downloadTelegramPhoto: getFile API failed: {}", .{err});
         return null;
     };
-    defer allocator.free(resp);
+    defer allocator.free(tg_file_path);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch |err| {
-        log.warn("downloadTelegramPhoto: JSON parse failed: {}", .{err});
-        return null;
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-
-    const result_obj = parsed.value.object.get("result") orelse {
-        log.warn("downloadTelegramPhoto: no 'result' in response", .{});
-        return null;
-    };
-    if (result_obj != .object) return null;
-    const fp_val = result_obj.object.get("file_path") orelse {
-        log.warn("downloadTelegramPhoto: no 'file_path' in result", .{});
-        return null;
-    };
-    const tg_file_path = if (fp_val == .string) fp_val.string else return null;
-
-    // 2. Download the file
-    var dl_url_buf: [1024]u8 = undefined;
-    var dl_fbs = std.io.fixedBufferStream(&dl_url_buf);
-    dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
-    const dl_url = dl_fbs.getWritten();
-
-    const data = root.http_util.curlGetWithProxy(allocator, dl_url, &.{}, "30", proxy) catch |err| {
+    const data = api_client.downloadFile(allocator, tg_file_path, "30") catch |err| {
         log.warn("downloadTelegramPhoto: file download failed: {}", .{err});
         return null;
     };
@@ -3090,49 +3001,18 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
 /// Download any file from Telegram by file_id. Preserves the original filename when provided.
 /// Returns the local temp file path (caller-owned).
 fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8, file_name: ?[]const u8, proxy: ?[]const u8) ?[]u8 {
-    // 1. Call getFile to get file_path
-    var url_buf: [512]u8 = undefined;
-    var url_fbs = std.io.fixedBufferStream(&url_buf);
-    url_fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token}) catch return null;
-    const api_url = url_fbs.getWritten();
-
-    var body_list: std.ArrayListUnmanaged(u8) = .empty;
-    defer body_list.deinit(allocator);
-    body_list.appendSlice(allocator, "{\"file_id\":") catch return null;
-    root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
-    body_list.appendSlice(allocator, "}") catch return null;
-
-    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, "15") catch |err| {
+    const api_client = telegram_api.Client{
+        .allocator = allocator,
+        .bot_token = bot_token,
+        .proxy = proxy,
+    };
+    const tg_file_path = api_client.getFilePath(allocator, file_id) catch |err| {
         log.warn("downloadTelegramFile: getFile API failed: {}", .{err});
         return null;
     };
-    defer allocator.free(resp);
+    defer allocator.free(tg_file_path);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch |err| {
-        log.warn("downloadTelegramFile: JSON parse failed: {}", .{err});
-        return null;
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-
-    const result_obj = parsed.value.object.get("result") orelse {
-        log.warn("downloadTelegramFile: no 'result' in response", .{});
-        return null;
-    };
-    if (result_obj != .object) return null;
-    const fp_val = result_obj.object.get("file_path") orelse {
-        log.warn("downloadTelegramFile: no 'file_path' in result", .{});
-        return null;
-    };
-    const tg_file_path = if (fp_val == .string) fp_val.string else return null;
-
-    // 2. Download the file
-    var dl_url_buf: [1024]u8 = undefined;
-    var dl_fbs = std.io.fixedBufferStream(&dl_url_buf);
-    dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
-    const dl_url = dl_fbs.getWritten();
-
-    const data = root.http_util.curlGetWithProxy(allocator, dl_url, &.{}, "60", proxy) catch |err| {
+    const data = api_client.downloadFile(allocator, tg_file_path, "60") catch |err| {
         log.warn("downloadTelegramFile: file download failed: {}", .{err});
         return null;
     };
@@ -4731,11 +4611,6 @@ test "telegram resolveAttachmentPath keeps absolute local path unchanged" {
 
     try std.testing.expect(resolved.owned == null);
     try std.testing.expectEqualStrings(input, resolved.path);
-}
-
-test "telegram bot command payload includes memory and doctor commands" {
-    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"doctor\"") != null);
 }
 
 fn makeTestChoicesDirective(allocator: std.mem.Allocator) !interaction_choices.ChoicesDirective {
