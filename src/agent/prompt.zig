@@ -196,9 +196,6 @@ pub fn buildSystemPrompt(
     // Identity section — inject workspace MD files
     try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider);
 
-    // Tools section
-    try buildToolsSection(w, ctx.tools);
-
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
 
@@ -298,6 +295,9 @@ pub fn buildSystemPrompt(
         @tagName(builtin.os.tag),
         ctx.model_name,
     });
+
+    // Tool use protocol and available tools
+    try writeToolInstructionsSection(w, ctx.tools);
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -448,18 +448,6 @@ test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "outside-secret-rules") == null);
 }
 
-fn buildToolsSection(w: anytype, tools: []const Tool) !void {
-    try w.writeAll("## Tools\n\n");
-    for (tools) |t| {
-        try std.fmt.format(w, "- **{s}**: {s}\n  Parameters: `{s}`\n", .{
-            t.name(),
-            t.description(),
-            t.parametersJson(),
-        });
-    }
-    try w.writeAll("\n");
-}
-
 fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("## Channel Attachments\n\n");
     try w.writeAll("- On marker-aware channels (for example Telegram), you can send real attachments by emitting markers in your final reply.\n");
@@ -479,6 +467,40 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("- Each option must include `id` and `label`; `submit_text` is optional (if omitted, label is used as submit text).\n");
     try w.writeAll("- `id` must be lowercase and contain only `a-z`, `0-9`, `_`, `-` (example: `yes`, `no`, `later_10m`).\n");
     try w.writeAll("- Example: `<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\"}]}</nc_choices>`\n\n");
+}
+
+pub fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
+    try w.writeAll("\n## Tool Use Protocol\n\n");
+    try w.writeAll("To use a tool, you MUST wrap a JSON object in <tool_call></tool_call> or [TOOL_CALL][/TOOL_CALL] tags.\n");
+    try w.writeAll("The JSON object MUST contain exactly two fields: \"name\" (string) and \"arguments\" (object).\n\n");
+    try w.writeAll("Example:\n```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+    try w.writeAll("CRITICAL RULES:\n");
+    try w.writeAll("1. ONLY use the format above. NEVER use <invoke>, <function>, or other XML-like formats.\n");
+    try w.writeAll("2. Output actual tags -- never describe steps or give examples.\n");
+    try w.writeAll("3. The internal content MUST be valid JSON. No trailing commas, no unquoted keys.\n\n");
+    try w.writeAll("You may use multiple tool calls in a single response. ");
+    try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
+    try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
+    try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
+    try w.writeAll("### Available Tools\n\n");
+
+    for (tools) |t| {
+        try std.fmt.format(w, "**{s}**: {s}\nParameters: `{s}`\n\n", .{
+            t.name(),
+            t.description(),
+            t.parametersJson(),
+        });
+    }
+}
+
+/// Allocating wrapper around writeToolInstructionsSection for callers
+/// that need the tool instructions as a standalone string (e.g. subagent runner).
+pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try writeToolInstructionsSection(w, tools);
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn writeXmlEscapedAttrValue(w: anytype, value: []const u8) !void {
@@ -812,7 +834,7 @@ test "buildSystemPrompt includes core sections" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Project Context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Tool Use Protocol") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Safety") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);

@@ -1008,7 +1008,7 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
-            const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
+            const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = self.model_name,
                 .tools = self.tools,
@@ -1016,15 +1016,6 @@ pub const Agent = struct {
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
             });
-            defer self.allocator.free(system_prompt);
-
-            // Append tool instructions
-            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
-            defer self.allocator.free(tool_instructions);
-
-            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
-            @memcpy(full_system[0..system_prompt.len], system_prompt);
-            @memcpy(full_system[system_prompt.len..], tool_instructions);
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -2384,7 +2375,6 @@ test "dispatcher module reexport" {
     _ = dispatcher.ToolExecutionResult;
     _ = dispatcher.parseToolCalls;
     _ = dispatcher.formatToolResults;
-    _ = dispatcher.buildToolInstructions;
     _ = dispatcher.buildAssistantHistoryWithToolCalls;
 }
 

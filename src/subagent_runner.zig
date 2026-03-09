@@ -123,7 +123,7 @@ pub fn runTaskWithTools(
     defer agent.deinit();
     agent.policy = &policy;
 
-    const tool_instructions = try agent_mod.dispatcher.buildToolInstructions(allocator, tools);
+    const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
     defer allocator.free(tool_instructions);
 
     const full_system = try std.fmt.allocPrint(
