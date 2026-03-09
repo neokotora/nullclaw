@@ -15,6 +15,11 @@ const pathStartsWith = path_prefix.pathStartsWith;
 
 /// Maximum characters to include from a single workspace identity file.
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+/// Read one extra byte via providers so prompt rendering can distinguish
+/// "exactly at cap" from "truncated beyond cap" without loading full files.
+const BOOTSTRAP_PROVIDER_EXCERPT_BYTES: usize = BOOTSTRAP_MAX_CHARS + 1;
+/// Maximum total characters from injected bootstrap identity files.
+const BOOTSTRAP_TOTAL_MAX_CHARS: usize = 24_000;
 /// Maximum bytes allowed for guarded workspace bootstrap file reads.
 const MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -303,6 +308,9 @@ fn buildIdentitySection(
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
 ) !void {
+    var remaining_bootstrap_chars: usize = BOOTSTRAP_TOTAL_MAX_CHARS;
+    var hit_total_bootstrap_limit = false;
+
     try w.writeAll("## Project Context\n\n");
     try w.writeAll("The following workspace files define your identity, behavior, and context.\n\n");
     try w.writeAll("If AGENTS.md is present, follow its operational guidance (including startup routines and red-line constraints) unless higher-priority instructions override it.\n\n");
@@ -320,11 +328,34 @@ fn buildIdentitySection(
     };
 
     for (identity_files) |filename| {
-        try injectWorkspaceFile(allocator, w, workspace_dir, filename, bootstrap_provider);
+        try injectWorkspaceFile(
+            allocator,
+            w,
+            workspace_dir,
+            filename,
+            bootstrap_provider,
+            &remaining_bootstrap_chars,
+            &hit_total_bootstrap_limit,
+        );
     }
 
     // Inject MEMORY.md if present, otherwise fallback to memory.md.
-    try injectPreferredMemoryFile(allocator, w, workspace_dir, bootstrap_provider);
+    try injectPreferredMemoryFile(
+        allocator,
+        w,
+        workspace_dir,
+        bootstrap_provider,
+        &remaining_bootstrap_chars,
+        &hit_total_bootstrap_limit,
+    );
+
+    if (hit_total_bootstrap_limit) {
+        try std.fmt.format(
+            w,
+            "[... project context truncated at {d} chars total -- use `read` for full files]\n\n",
+            .{BOOTSTRAP_TOTAL_MAX_CHARS},
+        );
+    }
 }
 
 test "buildSystemPrompt includes SOUL persona guidance" {
@@ -580,13 +611,21 @@ fn injectWorkspaceFile(
     workspace_dir: []const u8,
     filename: []const u8,
     bootstrap_provider: ?BootstrapProvider,
+    remaining_bootstrap_chars: *usize,
+    hit_total_bootstrap_limit: *bool,
 ) !void {
     // Try bootstrap provider first when available.
     if (bootstrap_provider) |bp| {
-        const content = bp.load(allocator, filename) catch null;
+        const content = bp.load_excerpt(allocator, filename, BOOTSTRAP_PROVIDER_EXCERPT_BYTES) catch null;
         if (content) |c| {
             defer allocator.free(c);
-            try appendPromptSectionContent(w, filename, c);
+            try appendPromptSectionContent(
+                w,
+                filename,
+                c,
+                remaining_bootstrap_chars,
+                hit_total_bootstrap_limit,
+            );
             return;
         }
         // Provider returned null — fall through to file-based path.
@@ -601,7 +640,14 @@ fn injectWorkspaceFile(
     var guarded = opened.?;
     defer deinitGuardedWorkspaceFile(allocator, guarded);
 
-    try appendWorkspaceFileContent(allocator, w, filename, &guarded.file);
+    try appendWorkspaceFileContent(
+        allocator,
+        w,
+        filename,
+        &guarded.file,
+        remaining_bootstrap_chars,
+        hit_total_bootstrap_limit,
+    );
 }
 
 fn appendWorkspaceFileContent(
@@ -609,34 +655,68 @@ fn appendWorkspaceFileContent(
     w: anytype,
     filename: []const u8,
     file: *std.fs.File,
+    remaining_bootstrap_chars: *usize,
+    hit_total_bootstrap_limit: *bool,
 ) !void {
-    // Read up to BOOTSTRAP_MAX_CHARS + some margin
-    const content = file.readToEndAlloc(allocator, BOOTSTRAP_MAX_CHARS + 1024) catch {
+    // The caller already size-guards workspace bootstrap files to 2 MiB max.
+    // Read the guarded file and let appendPromptSectionContent enforce
+    // per-file and total prompt truncation semantics consistently.
+    const content = file.readToEndAlloc(allocator, @intCast(MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES)) catch {
         try std.fmt.format(w, "### {s}\n\n[Could not read: {s}]\n\n", .{ filename, filename });
         return;
     };
     defer allocator.free(content);
 
-    try appendPromptSectionContent(w, filename, content);
+    try appendPromptSectionContent(
+        w,
+        filename,
+        content,
+        remaining_bootstrap_chars,
+        hit_total_bootstrap_limit,
+    );
 }
 
 fn appendPromptSectionContent(
     w: anytype,
     filename: []const u8,
     content: []const u8,
+    remaining_bootstrap_chars: *usize,
+    hit_total_bootstrap_limit: *bool,
 ) !void {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len == 0) return;
+    if (remaining_bootstrap_chars.* == 0) {
+        hit_total_bootstrap_limit.* = true;
+        return;
+    }
 
     try std.fmt.format(w, "### {s}\n\n", .{filename});
 
-    if (trimmed.len > BOOTSTRAP_MAX_CHARS) {
-        try w.writeAll(trimmed[0..BOOTSTRAP_MAX_CHARS]);
-        try std.fmt.format(w, "\n\n[... truncated at {d} chars -- use `read` for full file]\n\n", .{BOOTSTRAP_MAX_CHARS});
-    } else {
-        try w.writeAll(trimmed);
-        try w.writeAll("\n\n");
+    const file_limited = if (trimmed.len > BOOTSTRAP_MAX_CHARS)
+        trimmed[0..BOOTSTRAP_MAX_CHARS]
+    else
+        trimmed;
+    const total_limited_len = @min(file_limited.len, remaining_bootstrap_chars.*);
+    const total_limited = file_limited[0..total_limited_len];
+
+    try w.writeAll(total_limited);
+    try w.writeAll("\n\n");
+
+    const truncated_by_file = trimmed.len > BOOTSTRAP_MAX_CHARS;
+    const truncated_by_total = total_limited_len < file_limited.len;
+    if (truncated_by_file and !truncated_by_total) {
+        try std.fmt.format(w, "[... truncated at {d} chars -- use `read` for full file]\n\n", .{BOOTSTRAP_MAX_CHARS});
     }
+    if (truncated_by_total) {
+        hit_total_bootstrap_limit.* = true;
+        try std.fmt.format(
+            w,
+            "[... stopped at project context budget ({d} chars total)]\n\n",
+            .{BOOTSTRAP_TOTAL_MAX_CHARS},
+        );
+    }
+
+    remaining_bootstrap_chars.* -= total_limited_len;
 }
 
 fn injectPreferredMemoryFile(
@@ -644,15 +724,23 @@ fn injectPreferredMemoryFile(
     w: anytype,
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
+    remaining_bootstrap_chars: *usize,
+    hit_total_bootstrap_limit: *bool,
 ) !void {
     // When bootstrap provider is available, try loading MEMORY.md through it.
     if (bootstrap_provider) |bp| {
         const memory_files = [_][]const u8{ "MEMORY.md", "memory.md" };
         for (memory_files) |filename| {
-            const content = bp.load(allocator, filename) catch null;
+            const content = bp.load_excerpt(allocator, filename, BOOTSTRAP_PROVIDER_EXCERPT_BYTES) catch null;
             if (content) |c| {
                 defer allocator.free(c);
-                try appendPromptSectionContent(w, filename, c);
+                try appendPromptSectionContent(
+                    w,
+                    filename,
+                    c,
+                    remaining_bootstrap_chars,
+                    hit_total_bootstrap_limit,
+                );
                 return; // Found via provider, done.
             }
         }
@@ -679,7 +767,14 @@ fn injectPreferredMemoryFile(
         }
         try seen_memory_paths.put(allocator, try allocator.dupe(u8, guarded.canonical_path), {});
 
-        try appendWorkspaceFileContent(allocator, w, filename, &guarded.file);
+        try appendWorkspaceFileContent(
+            allocator,
+            w,
+            filename,
+            &guarded.file,
+            remaining_bootstrap_chars,
+            hit_total_bootstrap_limit,
+        );
     }
 }
 
@@ -909,6 +1004,158 @@ test "buildSystemPrompt injects USER.md when present" {
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "### USER.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "**Name:** user-test") != null);
+}
+
+test "appendPromptSectionContent skips section when total budget is exhausted" {
+    const allocator = std.testing.allocator;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    var remaining_bootstrap_chars: usize = 0;
+    var hit_total_bootstrap_limit = false;
+    try appendPromptSectionContent(
+        w,
+        "USER.md",
+        "this should not be rendered",
+        &remaining_bootstrap_chars,
+        &hit_total_bootstrap_limit,
+    );
+
+    try std.testing.expect(hit_total_bootstrap_limit);
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "buildSystemPrompt truncates project context at total bootstrap budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agents_content = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS);
+    defer allocator.free(agents_content);
+    @memset(agents_content, 'A');
+
+    const soul_content = try allocator.alloc(u8, 5_000);
+    defer allocator.free(soul_content);
+    @memset(soul_content, 'B');
+
+    {
+        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        defer f.close();
+        try f.writeAll(agents_content);
+    }
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll(soul_content);
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{});
+        defer f.close();
+        try f.writeAll("user-should-not-appear-after-budget");
+    }
+    {
+        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        defer f.close();
+        try f.writeAll("memory-should-not-appear-after-budget");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### SOUL.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, soul_content) == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, soul_content[0 .. BOOTSTRAP_TOTAL_MAX_CHARS - BOOTSTRAP_MAX_CHARS]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (24000 chars total)]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... project context truncated at 24000 chars total -- use `read` for full files]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### USER.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "user-should-not-appear-after-budget") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### MEMORY.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "memory-should-not-appear-after-budget") == null);
+}
+
+test "buildSystemPrompt omits per-file truncation marker when total budget stops earlier" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agents_content = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS);
+    defer allocator.free(agents_content);
+    @memset(agents_content, 'A');
+
+    const soul_content = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS + 512);
+    defer allocator.free(soul_content);
+    @memset(soul_content, 'B');
+
+    {
+        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        defer f.close();
+        try f.writeAll(agents_content);
+    }
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll(soul_content);
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    const file_truncation_marker = try std.fmt.allocPrint(
+        allocator,
+        "[... truncated at {d} chars -- use `read` for full file]",
+        .{BOOTSTRAP_MAX_CHARS},
+    );
+    defer allocator.free(file_truncation_marker);
+
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, prompt, file_truncation_marker));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... stopped at project context budget (24000 chars total)]") != null);
+}
+
+test "buildSystemPrompt truncates oversized disk bootstrap files instead of failing read" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const soul_content = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS + 6_000);
+    defer allocator.free(soul_content);
+    @memset(soul_content, 'S');
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll(soul_content);
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### SOUL.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[Could not read: SOUL.md]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 20000 chars -- use `read` for full file]") != null);
 }
 
 test "workspacePromptFingerprint is stable when files are unchanged" {

@@ -59,7 +59,7 @@ const CompatProvider = struct {
 
 const compat_providers = [_]CompatProvider{
     // ── Major Cloud Providers ─────────────────────────────────────────────
-    .{ .name = "groq", .url = "https://api.groq.com/openai", .display = "Groq" },
+    .{ .name = "groq", .url = "https://api.groq.com/openai/v1", .display = "Groq" },
     .{ .name = "mistral", .url = "https://api.mistral.ai/v1", .display = "Mistral" },
     .{ .name = "deepseek", .url = "https://api.deepseek.com", .display = "DeepSeek" },
     .{ .name = "xai", .url = "https://api.x.ai", .display = "xAI" },
@@ -421,7 +421,7 @@ test "classifyProvider new providers" {
 
 test "compatibleProviderUrl returns correct URLs" {
     try std.testing.expectEqualStrings("https://api.venice.ai", compatibleProviderUrl("venice").?);
-    try std.testing.expectEqualStrings("https://api.groq.com/openai", compatibleProviderUrl("groq").?);
+    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1", compatibleProviderUrl("groq").?);
     try std.testing.expectEqualStrings("https://api.deepseek.com", compatibleProviderUrl("deepseek").?);
     try std.testing.expectEqualStrings("https://api.poe.com/v1", compatibleProviderUrl("poe").?);
     try std.testing.expect(compatibleProviderUrl("nonexistent") == null);

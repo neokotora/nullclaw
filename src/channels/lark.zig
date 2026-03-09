@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.lark);
 
@@ -616,7 +617,7 @@ pub const LarkChannel = struct {
         }
 
         self.connected.store(false, .release);
-        self.ws_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, websocketLoop, .{self}) catch |err| {
+        self.ws_thread = std.Thread.spawn(.{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE }, websocketLoop, .{self}) catch |err| {
             self.running.store(false, .release);
             return err;
         };

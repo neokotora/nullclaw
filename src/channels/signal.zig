@@ -38,6 +38,7 @@ const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const sse_client = @import("../sse_client.zig");
 const platform = @import("../platform.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.signal);
 
@@ -858,7 +859,7 @@ pub const SignalChannel = struct {
             .target = key_copy,
         };
 
-        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        task.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, typingLoop, .{task});
         errdefer {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();

@@ -19,6 +19,8 @@
 
 The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
 
+Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md)
+
 ```
 678 KB binary · <2 ms startup · 3,230+ tests · 23+ providers · 18 channels · Pluggable everything
 ```
@@ -63,6 +65,42 @@ ls -lh zig-out/bin/nullclaw
 /usr/bin/time -l zig-out/bin/nullclaw --help
 /usr/bin/time -l zig-out/bin/nullclaw status
 ```
+
+## Documentation
+
+Start here if you want the shortest path to install, configure, operate, or extend nullclaw.
+
+Localized documentation lives under `docs/en/` and `docs/zh/`. Use the links below to jump straight to the page you need.
+
+| Need | English | 中文 |
+|---|---|---|
+| Start here | [`docs/en/README.md`](docs/en/README.md) | [`docs/zh/README.md`](docs/zh/README.md) |
+| Install | [`docs/en/installation.md`](docs/en/installation.md) | [`docs/zh/installation.md`](docs/zh/installation.md) |
+| Configure | [`docs/en/configuration.md`](docs/en/configuration.md) | [`docs/zh/configuration.md`](docs/zh/configuration.md) |
+| Commands | [`docs/en/commands.md`](docs/en/commands.md) | [`docs/zh/commands.md`](docs/zh/commands.md) |
+| Development | [`docs/en/development.md`](docs/en/development.md) | [`docs/zh/development.md`](docs/zh/development.md) |
+| Operations | [`docs/en/usage.md`](docs/en/usage.md) | [`docs/zh/usage.md`](docs/zh/usage.md) |
+| Architecture | [`docs/en/architecture.md`](docs/en/architecture.md) | [`docs/zh/architecture.md`](docs/zh/architecture.md) |
+| Security | [`docs/en/security.md`](docs/en/security.md) | [`docs/zh/security.md`](docs/zh/security.md) |
+| Gateway API | [`docs/en/gateway-api.md`](docs/en/gateway-api.md) | [`docs/zh/gateway-api.md`](docs/zh/gateway-api.md) |
+
+- Specialized guides: [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), [`SIGNAL.md`](SIGNAL.md)
+
+## Choose Your Path
+
+| Goal | Open this first | Then go to |
+|---|---|---|
+| First run in English | [`docs/en/README.md`](docs/en/README.md) | [`docs/en/installation.md`](docs/en/installation.md) → [`docs/en/configuration.md`](docs/en/configuration.md) → [`docs/en/usage.md`](docs/en/usage.md) |
+| 中文快速上手 | [`docs/zh/README.md`](docs/zh/README.md) | [`docs/zh/installation.md`](docs/zh/installation.md) → [`docs/zh/configuration.md`](docs/zh/configuration.md) → [`docs/zh/usage.md`](docs/zh/usage.md) |
+| Find the right CLI command | [`docs/en/commands.md`](docs/en/commands.md) / [`docs/zh/commands.md`](docs/zh/commands.md) | `nullclaw help` → task-specific subcommand page |
+| Contribute code or docs | [`CONTRIBUTING.md`](CONTRIBUTING.md) | [`docs/en/development.md`](docs/en/development.md) / [`docs/zh/development.md`](docs/zh/development.md) → relevant architecture page |
+| Operate or secure a deployment | [`docs/en/usage.md`](docs/en/usage.md) / [`docs/zh/usage.md`](docs/zh/usage.md) | [`docs/en/security.md`](docs/en/security.md) / [`docs/zh/security.md`](docs/zh/security.md) → Gateway API |
+
+## After This README
+
+- New here: jump to [`docs/en/README.md`](docs/en/README.md) or [`docs/zh/README.md`](docs/zh/README.md) and follow the guided reading order.
+- Want commands fast: open [`docs/en/commands.md`](docs/en/commands.md) or [`docs/zh/commands.md`](docs/zh/commands.md).
+- Want to submit a PR: start with [`CONTRIBUTING.md`](CONTRIBUTING.md), then read [`docs/en/development.md`](docs/en/development.md) or [`docs/zh/development.md`](docs/zh/development.md).
 
 ## Quick Start
 
@@ -615,6 +653,8 @@ nullclaw uses **CalVer** (`YYYY.M.D`) for releases — e.g. `v2026.2.20`.
 
 ## Contributing
 
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development environment setup, workflow, validation commands, and the PR checklist.
+
 Implement a vtable interface, submit a PR:
 
 - New `Provider` -> `src/providers/`
@@ -637,6 +677,18 @@ Implement a vtable interface, submit a PR:
 - [Gateway API](docs/zh/gateway-api.md)
 - [命令参考](docs/zh/commands.md)
 - [开发指南](docs/zh/development.md)
+
+## English Docs
+
+- [English docs overview](docs/en/README.md)
+- [Installation](docs/en/installation.md)
+- [Configuration](docs/en/configuration.md)
+- [Usage and operations](docs/en/usage.md)
+- [Architecture](docs/en/architecture.md)
+- [Security](docs/en/security.md)
+- [Gateway API](docs/en/gateway-api.md)
+- [Commands](docs/en/commands.md)
+- [Development](docs/en/development.md)
 
 ## Disclaimer
 

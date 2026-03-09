@@ -12,48 +12,15 @@ const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
+const control_plane = @import("../control_plane.zig");
 const version = @import("../version.zig");
 
-const SlashCommand = struct {
-    name: []const u8,
-    arg: []const u8,
-};
+const SlashCommand = control_plane.SlashCommand;
+const parseSlashCommand = control_plane.parseSlashCommand;
+const isSlashName = control_plane.isSlashName;
 
 pub const BARE_SESSION_RESET_PROMPT =
     "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
-
-fn parseSlashCommand(message: []const u8) ?SlashCommand {
-    const trimmed = std.mem.trim(u8, message, " \t\r\n");
-    if (trimmed.len <= 1 or trimmed[0] != '/') return null;
-
-    const body = trimmed[1..];
-    var split_idx: usize = 0;
-    while (split_idx < body.len) : (split_idx += 1) {
-        const ch = body[split_idx];
-        if (ch == ':' or ch == ' ' or ch == '\t') break;
-    }
-    if (split_idx == 0) return null;
-
-    const raw_name = body[0..split_idx];
-    const name = if (std.mem.indexOfScalar(u8, raw_name, '@')) |mention_sep|
-        raw_name[0..mention_sep]
-    else
-        raw_name;
-    if (name.len == 0) return null;
-    var rest = body[split_idx..];
-    if (rest.len > 0 and rest[0] == ':') {
-        rest = rest[1..];
-    }
-
-    return .{
-        .name = name,
-        .arg = std.mem.trim(u8, rest, " \t"),
-    };
-}
-
-fn isSlashName(cmd: SlashCommand, expected: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(cmd.name, expected);
-}
 
 pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
@@ -252,18 +219,6 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
     const primary = try configPrimaryModelForSelection(&dummy, "customgw/model-a");
     defer allocator.free(primary);
     try std.testing.expectEqualStrings("customgw/model-a", primary);
-}
-
-test "parseSlashCommand strips bot mention from command name" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("model", parsed.name);
-    try std.testing.expectEqualStrings("openrouter/inception/mercury", parsed.arg);
-}
-
-test "parseSlashCommand strips bot mention with colon separator" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("model", parsed.name);
-    try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
 }
 
 test "bareSessionResetPrompt returns prompt for bare /new" {
@@ -2412,25 +2367,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     }
 
     if (isSlashName(cmd, "help") or isSlashName(cmd, "commands")) {
-        return try self.allocator.dupe(u8,
-            \\Available commands:
-            \\  /new, /reset [model], /restart [model]
-            \\  /help, /commands, /status, /whoami, /id
-            \\  /model, /models, /model <name>
-            \\  /think, /verbose, /reasoning
-            \\  /exec, /queue, /usage, /tts, /voice
-            \\  /stop, /abort, /compact
-            \\  /allowlist, /approve, /context
-            \\  /export-session, /export
-            \\  /session ttl <duration|off>
-            \\  /subagents, /agents, /focus, /unfocus, /kill, /steer, /tell
-            \\  /config, /capabilities, /debug
-            \\  /dock-telegram, /dock-discord, /dock-slack
-            \\  /activation, /send, /elevated, /bash, /poll, /skill
-            \\  /doctor — memory subsystem diagnostics
-            \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
-            \\  exit, quit
-        );
+        return try self.allocator.dupe(u8, control_plane.HELP_TEXT);
     }
 
     if (isSlashName(cmd, "status")) return try formatStatus(self);

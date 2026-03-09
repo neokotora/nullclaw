@@ -36,6 +36,75 @@ const Command = enum {
     help,
 };
 
+const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
+const CRON_SUBCOMMANDS = "list|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
+const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
+const SKILLS_SUBCOMMANDS = "list|install|remove|info";
+const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
+const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget";
+const WORKSPACE_SUBCOMMANDS = "edit|reset-md";
+const MODELS_SUBCOMMANDS = "list|info|benchmark|refresh";
+const AUTH_SUBCOMMANDS = "login|status|logout";
+
+const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
+    \\nullclaw -- The smallest AI assistant. Zig-powered.
+    \\
+    \\USAGE:
+    \\  nullclaw <command> [options]
+    \\
+    \\COMMANDS:
+    \\  onboard      Initialize workspace and configuration
+    \\  agent        Start the AI agent loop
+    \\  gateway      Start the gateway server (HTTP/WebSocket)
+    \\  service      Manage OS service lifecycle
+    \\  status       Show system status
+    \\  version      Show CLI version
+    \\  doctor       Run diagnostics
+    \\  cron         Manage scheduled tasks
+    \\  channel      Manage channels (Telegram, Discord, Slack, ...)
+    \\  skills       Manage skills
+    \\  hardware     Discover and manage hardware
+    \\  migrate      Migrate data from other agent runtimes
+    \\  memory       Inspect and maintain memory subsystem
+    \\  workspace    Maintain workspace markdown/bootstrap files
+    \\  capabilities Show runtime capabilities manifest
+    \\  models       Manage provider model catalogs
+    \\  auth         Manage OAuth authentication (OpenAI Codex)
+    \\  update       Check for and install updates
+    \\  help         Show this help
+    \\
+    \\OPTIONS:
+    \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
+    \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
+    \\  gateway [--port PORT] [--host HOST]
+    \\  version | --version | -V
+    \\  service <{s}>
+    \\  cron <{s}> [ARGS]
+    \\  channel <{s}> [ARGS]
+    \\  skills <{s}> [ARGS]
+    \\  hardware <{s}> [ARGS]
+    \\  migrate openclaw [--dry-run] [--source PATH]
+    \\  memory <{s}> [ARGS]
+    \\  workspace <{s}> [ARGS]
+    \\  capabilities [--json]
+    \\  models <{s}> [ARGS]
+    \\  auth <{s}> <provider> [--import-codex]
+    \\  update [--check] [--yes]
+    \\
+,
+    .{
+        SERVICE_SUBCOMMANDS,
+        CRON_SUBCOMMANDS,
+        CHANNEL_SUBCOMMANDS,
+        SKILLS_SUBCOMMANDS,
+        HARDWARE_SUBCOMMANDS,
+        MEMORY_SUBCOMMANDS,
+        WORKSPACE_SUBCOMMANDS,
+        MODELS_SUBCOMMANDS,
+        AUTH_SUBCOMMANDS,
+    },
+);
+
 fn parseCommand(arg: []const u8) ?Command {
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "agent", .agent },
@@ -234,7 +303,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
-        std.debug.print("Usage: nullclaw service <install|start|stop|restart|status|uninstall>\n", .{});
+        std.debug.print(std.fmt.comptimePrint("Usage: nullclaw service <{s}>\n", .{SERVICE_SUBCOMMANDS}), .{});
         std.process.exit(1);
     }
 
@@ -252,7 +321,7 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             if (std.mem.eql(u8, subcmd, entry[0])) break :blk entry[1];
         }
         std.debug.print("Unknown service command: {s}\n", .{subcmd});
-        std.debug.print("Usage: nullclaw service <install|start|stop|restart|status|uninstall>\n", .{});
+        std.debug.print(std.fmt.comptimePrint("Usage: nullclaw service <{s}>\n", .{SERVICE_SUBCOMMANDS}), .{});
         std.process.exit(1);
     };
 
@@ -292,8 +361,8 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
-        std.debug.print(
-            \\Usage: nullclaw cron <command> [args]
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw cron <{s}> [args]
             \\
             \\Commands:
             \\  list                          List all scheduled tasks
@@ -310,7 +379,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  update <id> [options]         Update a cron job
             \\  runs <id>                     List recent run history for a job
             \\
-        , .{});
+        , .{CRON_SUBCOMMANDS}), .{});
         std.process.exit(1);
     }
 
@@ -430,8 +499,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
 fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
-        std.debug.print(
-            \\Usage: nullclaw channel <command> [args]
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw channel <{s}> [args]
             \\
             \\Commands:
             \\  list                          List configured channels
@@ -440,7 +509,7 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\  add <type> <config_json>      Add a channel
             \\  remove <name>                 Remove a channel
             \\
-        , .{});
+        , .{CHANNEL_SUBCOMMANDS}), .{});
         std.process.exit(1);
     }
 
@@ -499,8 +568,8 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
-        std.debug.print(
-            \\Usage: nullclaw skills <command> [args]
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw skills <{s}> [args]
             \\
             \\Commands:
             \\  list                          List installed skills
@@ -508,7 +577,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  remove <name>                 Remove a skill
             \\  info <name>                   Show skill details
             \\
-        , .{});
+        , .{SKILLS_SUBCOMMANDS}), .{});
         std.process.exit(1);
     }
 
@@ -603,15 +672,15 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
 fn runHardware(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
-        std.debug.print(
-            \\Usage: nullclaw hardware <command> [args]
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw hardware <{s}> [args]
             \\
             \\Commands:
             \\  scan                          Scan for connected hardware
             \\  flash                         Flash firmware to a device
             \\  monitor                       Monitor connected devices
             \\
-        , .{});
+        , .{HARDWARE_SUBCOMMANDS}), .{});
         std.process.exit(1);
     }
 
@@ -719,8 +788,8 @@ fn runMigrate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 // ── Memory ───────────────────────────────────────────────────────
 
 fn printMemoryUsage() void {
-    std.debug.print(
-        \\Usage: nullclaw memory <command> [args]
+    std.debug.print(std.fmt.comptimePrint(
+        \\Usage: nullclaw memory <{s}> [args]
         \\
         \\Commands:
         \\  stats                         Show resolved memory config and key counters
@@ -733,12 +802,12 @@ fn printMemoryUsage() void {
         \\  drain-outbox                  Drain durable vector outbox queue
         \\  forget <key>                  Delete entry from primary memory (if backend supports)
         \\
-    , .{});
+    , .{MEMORY_SUBCOMMANDS}), .{});
 }
 
 fn printWorkspaceUsage() void {
-    std.debug.print(
-        \\Usage: nullclaw workspace <command> [args]
+    std.debug.print(std.fmt.comptimePrint(
+        \\Usage: nullclaw workspace <{s}> [args]
         \\
         \\Commands:
         \\  edit <filename>
@@ -753,7 +822,7 @@ fn printWorkspaceUsage() void {
         \\      --clear-memory-md    Remove MEMORY.md and memory.md if present
         \\      --dry-run            Show what would be changed without modifying files
         \\
-    , .{});
+    , .{WORKSPACE_SUBCOMMANDS}), .{});
 }
 
 fn parsePositiveUsize(arg: []const u8) ?usize {
@@ -1169,8 +1238,8 @@ fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !
 
 fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
-        std.debug.print(
-            \\Usage: nullclaw models <command>
+        std.debug.print(std.fmt.comptimePrint(
+            \\Usage: nullclaw models <{s}> [args]
             \\
             \\Commands:
             \\  list                          List available models
@@ -1178,7 +1247,7 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  benchmark                     Run model latency benchmark
             \\  refresh                       Refresh model catalog
             \\
-        , .{});
+        , .{MODELS_SUBCOMMANDS}), .{});
         std.process.exit(1);
     }
 
@@ -2382,8 +2451,8 @@ fn runUpdate(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 }
 
 fn printAuthUsage() void {
-    std.debug.print(
-        \\Usage: nullclaw auth <command> <provider> [options]
+    std.debug.print(std.fmt.comptimePrint(
+        \\Usage: nullclaw auth <{s}> <provider> [options]
         \\
         \\Commands:
         \\  login <provider>                    Authenticate via device code flow
@@ -2400,7 +2469,7 @@ fn printAuthUsage() void {
         \\  nullclaw auth status openai-codex
         \\  nullclaw auth logout openai-codex
         \\
-    , .{});
+    , .{AUTH_SUBCOMMANDS}), .{});
 }
 
 fn runAuthDeviceCodeLogin(
@@ -2622,53 +2691,7 @@ fn saveAndPrintResult(
 }
 
 fn printUsage() void {
-    const usage =
-        \\nullclaw -- The smallest AI assistant. Zig-powered.
-        \\
-        \\USAGE:
-        \\  nullclaw <command> [options]
-        \\
-        \\COMMANDS:
-        \\  onboard     Initialize workspace and configuration
-        \\  agent       Start the AI agent loop
-        \\  gateway     Start the gateway server (HTTP/WebSocket)
-        \\  service     Manage OS service lifecycle (install/start/stop/restart/status/uninstall)
-        \\  status      Show system status
-        \\  version     Show CLI version
-        \\  doctor      Run diagnostics
-        \\  cron        Manage scheduled tasks
-        \\  channel     Manage channels (Telegram, Discord, Slack, ...)
-        \\  skills      Manage skills
-        \\  hardware    Discover and manage hardware
-        \\  migrate     Migrate data from other agent runtimes
-        \\  memory      Inspect and maintain memory subsystem
-        \\  workspace   Maintain workspace markdown/bootstrap files
-        \\  capabilities Show runtime capabilities manifest
-        \\  models      Manage provider model catalogs
-        \\  auth        Manage OAuth authentication (OpenAI Codex)
-        \\  update      Check for and install updates
-        \\  help        Show this help
-        \\
-        \\OPTIONS:
-        \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
-        \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
-        \\  gateway [--port PORT] [--host HOST]
-        \\  version | --version | -V
-        \\  service <install|start|stop|restart|status|uninstall>
-        \\  cron <list|add|once|remove|pause|resume> [ARGS]
-        \\  channel <list|start|status|add|remove> [ARGS]
-        \\  skills <list|install|remove> [ARGS]
-        \\  hardware <discover|introspect|info> [ARGS]
-        \\  migrate openclaw [--dry-run] [--source PATH]
-        \\  memory <stats|count|reindex|search|get|list|drain-outbox|forget> [ARGS]
-        \\  workspace reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
-        \\  capabilities [--json]
-        \\  models refresh
-        \\  auth <login|status|logout> <provider> [--import-codex]
-        \\  update [--check] [--yes]
-        \\
-    ;
-    std.debug.print("{s}", .{usage});
+    std.debug.print("{s}", .{TOP_LEVEL_USAGE});
 }
 
 test "parse known commands" {
@@ -2687,6 +2710,18 @@ test "parse known commands" {
     try std.testing.expectEqual(.update, parseCommand("update").?);
     try std.testing.expect(parseCommand("daemon") == null);
     try std.testing.expect(parseCommand("unknown") == null);
+}
+
+test "top level usage stays aligned with current subcommand synopses" {
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "service <" ++ SERVICE_SUBCOMMANDS ++ ">"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "cron <" ++ CRON_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "channel <" ++ CHANNEL_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "skills <" ++ SKILLS_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "hardware <" ++ HARDWARE_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "memory <" ++ MEMORY_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "workspace <" ++ WORKSPACE_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "models <" ++ MODELS_SUBCOMMANDS ++ "> [ARGS]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, TOP_LEVEL_USAGE, 1, "auth <" ++ AUTH_SUBCOMMANDS ++ "> <provider> [--import-codex]"));
 }
 
 test "configureWindowsConsoleUtf8 is safe to call" {

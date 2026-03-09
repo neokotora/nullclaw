@@ -28,6 +28,7 @@ pub const SlackChannel = struct {
     last_ts_owned: bool = false,
     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
     thread_ts: ?[]const u8 = null,
+    reply_to_mode: config_types.SlackReplyToMode = .off,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -123,6 +124,7 @@ pub const SlackChannel = struct {
         ch.mode = cfg.mode;
         ch.signing_secret = cfg.signing_secret;
         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
+        ch.reply_to_mode = cfg.reply_to_mode;
         return ch;
     }
 
@@ -455,6 +457,25 @@ pub const SlackChannel = struct {
         const is_dm = isDirectConversationId(channel_id);
         if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
 
+        // Determine effective thread_ts for the reply target.
+        // A message with thread_ts == ts is a top-level post that merely started a
+        // thread; only thread_ts != ts means it is an actual thread reply.
+        const is_thread_reply = if (thread_ts) |tts|
+            if (message_ts) |mts| !std.mem.eql(u8, tts, mts) else true
+        else
+            false;
+        const effective_thread_ts: ?[]const u8 = switch (self.reply_to_mode) {
+            .off => if (is_thread_reply) thread_ts else null,
+            .all => thread_ts orelse message_ts,
+        };
+
+        // Build chat_id: "channel_id:thread_ts" for threaded replies, plain channel_id otherwise.
+        const chat_id = if (effective_thread_ts) |tts|
+            try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ channel_id, tts })
+        else
+            channel_id;
+        defer if (effective_thread_ts != null) self.allocator.free(chat_id);
+
         const session_key = if (is_dm)
             try std.fmt.allocPrint(self.allocator, "slack:{s}:direct:{s}", .{ self.account_id, sender_id })
         else
@@ -485,7 +506,7 @@ pub const SlackChannel = struct {
             self.allocator,
             "slack",
             sender_id,
-            channel_id,
+            chat_id,
             text,
             session_key,
             &.{},
@@ -1592,7 +1613,8 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("slack", msg.channel);
     try std.testing.expectEqualStrings("U123", msg.sender_id);
-    try std.testing.expectEqualStrings("C12345", msg.chat_id);
+    // thread_ts (1700000000.000) != ts (1700000000.100) → thread reply; chat_id includes thread_ts
+    try std.testing.expectEqualStrings("C12345:1700000000.000", msg.chat_id);
     try std.testing.expectEqualStrings("slack:sl-main:channel:C12345", msg.session_key);
     try std.testing.expectEqualStrings("hello from slack", msg.content);
     try std.testing.expect(msg.metadata_json != null);
@@ -1601,6 +1623,98 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     try std.testing.expect(meta.value == .object);
     try std.testing.expectEqualStrings("1700000000.100", meta.value.object.get("message_id").?.string);
     try std.testing.expectEqualStrings("1700000000.000", meta.value.object.get("thread_id").?.string);
+}
+
+test "processHistoryMessage off mode top-level post uses channel_id as chat_id" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.setBus(&eb);
+    // reply_to_mode defaults to .off
+
+    // thread_ts == ts: top-level post that started a thread, not a reply
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000001.000","thread_ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99", msg.chat_id);
+}
+
+test "processHistoryMessage off mode no thread_ts uses channel_id as chat_id" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99", msg.chat_id);
+}
+
+test "processHistoryMessage all mode no thread_ts uses message_ts as thread" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.reply_to_mode = .all;
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99:1700000001.000", msg.chat_id);
+}
+
+test "processHistoryMessage all mode with thread_ts uses thread_ts" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C99", &allowed);
+    ch.account_id = "sl-main";
+    ch.reply_to_mode = .all;
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"user":"U1","text":"hi","ts":"1700000002.000","thread_ts":"1700000001.000"}
+    , .{});
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C99");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("C99:1700000001.000", msg.chat_id);
 }
 
 test "mrkdwn bold conversion" {

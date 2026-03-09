@@ -188,7 +188,8 @@ fn curlRequestWithProxy(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
-    const term = child.wait() catch {
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
         allocator.free(stdout);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
@@ -304,7 +305,10 @@ pub fn curlPostWithStatus(
     };
     errdefer allocator.free(stdout);
 
-    const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+    };
     switch (term) {
         .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
@@ -411,7 +415,10 @@ fn curlGetWithProxyAndResolve(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
-    const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return error.CurlWaitError;
+    };
     switch (term) {
         .Exited => |code| if (code != 0) {
             allocator.free(stdout);
@@ -569,7 +576,8 @@ pub fn curlGetSSE(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
-    const term = child.wait() catch {
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
         allocator.free(stdout);
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };

@@ -595,6 +595,7 @@ pub fn curlStreamAnthropic(
 
     var current_event: []const u8 = "";
     var output_tokens: u32 = 0;
+    var saw_done = false;
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
@@ -622,6 +623,7 @@ pub fn curlStreamAnthropic(
                     },
                     .usage => |tokens| output_tokens = tokens,
                     .done => {
+                        saw_done = true;
                         line_buf.clearRetainingCapacity();
                         break :outer;
                     },
@@ -637,37 +639,42 @@ pub fn curlStreamAnthropic(
     // Free owned event string
     if (current_event.len > 0) allocator.free(@constCast(current_event));
 
-    // Send final chunk
-    callback(ctx, root.StreamChunk.finalChunk());
-
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curlStreamAnthropic child.wait failed: {}", .{err});
+        if (saw_done) {
+            log.warn("curlStreamAnthropic proceeding despite wait failure after receiving stream data", .{});
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+        }
+        return error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic exit code {d} after stream data; returning accumulated output", .{code});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic abnormal termination after stream data; returning accumulated output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+            }
+            return error.CurlFailed;
+        },
     }
 
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    // Use actual output_tokens if reported, otherwise estimate
-    const completion_tokens = if (output_tokens > 0)
-        output_tokens
-    else
-        @as(u32, @intCast((accumulated.items.len + 3) / 4));
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = completion_tokens },
-        .model = "",
-    };
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeStreamResult(allocator, accumulated.items, output_tokens);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
