@@ -202,8 +202,10 @@ pub const SessionStore = struct {
         clearAutoSaved: *const fn (ptr: *anyopaque, session_id: ?[]const u8) anyerror!void,
         saveUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void = null,
         loadUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!?u64 = null,
-        listSessions: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize) anyerror![]SessionInfo = null,
-        loadMessagesDetailed: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]DetailedMessageEntry = null,
+        countSessions: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
+        listSessions: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]SessionInfo = null,
+        countDetailedMessages: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!u64 = null,
+        loadMessagesDetailed: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]DetailedMessageEntry = null,
     };
 
     pub fn saveMessage(self: SessionStore, session_id: []const u8, role: []const u8, content: []const u8) !void {
@@ -232,14 +234,24 @@ pub const SessionStore = struct {
         return func(self.ptr, session_id);
     }
 
-    pub fn listSessions(self: SessionStore, allocator: std.mem.Allocator, limit: usize) ![]SessionInfo {
-        const func = self.vtable.listSessions orelse return error.NotSupported;
-        return func(self.ptr, allocator, limit);
+    pub fn countSessions(self: SessionStore) !u64 {
+        const func = self.vtable.countSessions orelse return error.NotSupported;
+        return func(self.ptr);
     }
 
-    pub fn loadMessagesDetailed(self: SessionStore, allocator: std.mem.Allocator, session_id: []const u8) ![]DetailedMessageEntry {
+    pub fn listSessions(self: SessionStore, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]SessionInfo {
+        const func = self.vtable.listSessions orelse return error.NotSupported;
+        return func(self.ptr, allocator, limit, offset);
+    }
+
+    pub fn countDetailedMessages(self: SessionStore, session_id: []const u8) !u64 {
+        const func = self.vtable.countDetailedMessages orelse return error.NotSupported;
+        return func(self.ptr, session_id);
+    }
+
+    pub fn loadMessagesDetailed(self: SessionStore, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) ![]DetailedMessageEntry {
         const func = self.vtable.loadMessagesDetailed orelse return error.NotSupported;
-        return func(self.ptr, allocator, session_id);
+        return func(self.ptr, allocator, session_id, limit, offset);
     }
 };
 

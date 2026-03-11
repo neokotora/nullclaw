@@ -902,6 +902,10 @@ fn parsePositiveUsize(arg: []const u8) ?usize {
     return n;
 }
 
+fn parseNonNegativeUsize(arg: []const u8) ?usize {
+    return std.fmt.parseInt(usize, arg, 10) catch null;
+}
+
 fn hasJsonFlag(args: []const []const u8) bool {
     for (args) |a| {
         if (std.mem.eql(u8, a, "--json")) return true;
@@ -1427,8 +1431,10 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Usage: nullclaw history <{s}> [args]
             \\
             \\Commands:
-            \\  list [--limit N] [--json]     List conversation sessions
-            \\  show <session_id> [--json]     Show messages for a session
+            \\  list [--limit N] [--offset N] [--json]
+            \\                                List conversation sessions
+            \\  show <session_id> [--limit N] [--offset N] [--json]
+            \\                                Show messages for a session
             \\
         , .{HISTORY_SUBCOMMANDS}), .{});
         std.process.exit(1);
@@ -1470,18 +1476,29 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
     if (std.mem.eql(u8, subcmd, "list")) {
         var limit: usize = 50;
+        var offset: usize = 0;
         var json_mode = false;
 
         var i: usize = 1;
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw history list [--limit N] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw history list [--limit N] [--offset N] [--json]\n", .{});
                     std.process.exit(1);
                 }
                 i += 1;
                 limit = parsePositiveUsize(sub_args[i]) orelse {
                     std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--offset")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history list [--limit N] [--offset N] [--json]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                offset = parseNonNegativeUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --offset value: {s}\n", .{sub_args[i]});
                     std.process.exit(1);
                 };
             } else if (std.mem.eql(u8, sub_args[i], "--json")) {
@@ -1492,7 +1509,26 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             }
         }
 
-        const sessions = session_store.listSessions(allocator, limit) catch |err| {
+        const total = session_store.countSessions() catch |err| {
+            if (err == error.NotSupported) {
+                if (json_mode) {
+                    var msg_buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "History listing not supported for backend: {s}", .{cfg.memory.backend}) catch "History listing not supported";
+                    writeJsonError("history_not_supported", msg, cfg.memory.backend);
+                }
+                std.debug.print("History listing not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
+            if (json_mode) {
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Failed to count sessions: {s}", .{@errorName(err)}) catch "Failed to count sessions";
+                writeJsonError("history_count_failed", msg, cfg.memory.backend);
+            }
+            std.debug.print("Failed to count sessions: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+
+        const sessions = session_store.listSessions(allocator, limit, offset) catch |err| {
             if (err == error.NotSupported) {
                 if (json_mode) {
                     var msg_buf: [256]u8 = undefined;
@@ -1513,15 +1549,17 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         defer yc.memory.freeSessionInfos(allocator, sessions);
 
         if (json_mode) {
-            writeHistoryListJson(sessions);
+            writeHistoryListJson(sessions, total, limit, offset);
         } else {
             if (sessions.len == 0) {
                 std.debug.print("No sessions found.\n", .{});
             } else {
-                std.debug.print("Sessions ({d}):\n", .{sessions.len});
+                const shown_from: u64 = @intCast(offset + 1);
+                const shown_to: u64 = @intCast(offset + sessions.len);
+                std.debug.print("Sessions: showing {d}-{d} of {d}\n", .{ shown_from, shown_to, total });
                 for (sessions, 0..) |s, idx| {
                     std.debug.print("  {d}. {s}  msgs={d}  first={s}  last={s}\n", .{
-                        idx + 1, s.session_id, s.message_count, s.first_message_at, s.last_message_at,
+                        offset + idx + 1, s.session_id, s.message_count, s.first_message_at, s.last_message_at,
                     });
                 }
             }
@@ -1531,15 +1569,37 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
     if (std.mem.eql(u8, subcmd, "show")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw history show <session_id> [--json]\n", .{});
+            std.debug.print("Usage: nullclaw history show <session_id> [--limit N] [--offset N] [--json]\n", .{});
             std.process.exit(1);
         }
         const session_id = sub_args[1];
+        var limit: usize = 100;
+        var offset: usize = 0;
         var json_mode = false;
 
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
-            if (std.mem.eql(u8, sub_args[i], "--json")) {
+            if (std.mem.eql(u8, sub_args[i], "--limit")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history show <session_id> [--limit N] [--offset N] [--json]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                limit = parsePositiveUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--offset")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw history show <session_id> [--limit N] [--offset N] [--json]\n", .{});
+                    std.process.exit(1);
+                }
+                i += 1;
+                offset = parseNonNegativeUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --offset value: {s}\n", .{sub_args[i]});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.eql(u8, sub_args[i], "--json")) {
                 json_mode = true;
             } else {
                 std.debug.print("Unknown option: {s}\n", .{sub_args[i]});
@@ -1547,7 +1607,26 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             }
         }
 
-        const messages = session_store.loadMessagesDetailed(allocator, session_id) catch |err| {
+        const total = session_store.countDetailedMessages(session_id) catch |err| {
+            if (err == error.NotSupported) {
+                if (json_mode) {
+                    var msg_buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Detailed history not supported for backend: {s}", .{cfg.memory.backend}) catch "Detailed history not supported";
+                    writeJsonError("history_not_supported", msg, cfg.memory.backend);
+                }
+                std.debug.print("Detailed history not supported for backend: {s}\n", .{cfg.memory.backend});
+                std.process.exit(1);
+            }
+            if (json_mode) {
+                var msg_buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Failed to count messages: {s}", .{@errorName(err)}) catch "Failed to count messages";
+                writeJsonError("history_count_failed", msg, cfg.memory.backend);
+            }
+            std.debug.print("Failed to count messages: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+
+        const messages = session_store.loadMessagesDetailed(allocator, session_id, limit, offset) catch |err| {
             if (err == error.NotSupported) {
                 if (json_mode) {
                     var msg_buf: [256]u8 = undefined;
@@ -1568,12 +1647,14 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         defer yc.memory.freeDetailedMessages(allocator, messages);
 
         if (json_mode) {
-            writeHistoryShowJson(session_id, messages);
+            writeHistoryShowJson(session_id, messages, total, limit, offset);
         } else {
             if (messages.len == 0) {
                 std.debug.print("No messages for session: {s}\n", .{session_id});
             } else {
-                std.debug.print("Session: {s} ({d} messages)\n\n", .{ session_id, messages.len });
+                const shown_from: u64 = @intCast(offset + 1);
+                const shown_to: u64 = @intCast(offset + messages.len);
+                std.debug.print("Session: {s} (showing {d}-{d} of {d})\n\n", .{ session_id, shown_from, shown_to, total });
                 for (messages) |m| {
                     std.debug.print("[{s}] {s}:\n{s}\n\n", .{ m.created_at, m.role, m.content });
                 }
@@ -1586,12 +1667,12 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     std.process.exit(1);
 }
 
-fn writeHistoryListJson(sessions: []const yc.memory.SessionInfo) void {
+fn writeHistoryListJson(sessions: []const yc.memory.SessionInfo, total: u64, limit: usize, offset: usize) void {
     var buf: [65536]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&buf);
     const out = &bw.interface;
 
-    out.writeAll("[") catch return;
+    out.print("{{\"total\":{d},\"limit\":{d},\"offset\":{d},\"sessions\":[", .{ total, limit, offset }) catch return;
     for (sessions, 0..) |s, idx| {
         if (idx > 0) out.writeAll(",") catch return;
         out.writeAll("{\"session_id\":") catch return;
@@ -1602,18 +1683,18 @@ fn writeHistoryListJson(sessions: []const yc.memory.SessionInfo) void {
         writeJsonString(out, s.last_message_at) catch return;
         out.writeAll("}") catch return;
     }
-    out.writeAll("]\n") catch return;
+    out.writeAll("]}\n") catch return;
     out.flush() catch return;
 }
 
-fn writeHistoryShowJson(session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry) void {
+fn writeHistoryShowJson(session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry, total: u64, limit: usize, offset: usize) void {
     var buf: [65536]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&buf);
     const out = &bw.interface;
 
     out.writeAll("{\"session_id\":") catch return;
     writeJsonString(out, session_id) catch return;
-    out.writeAll(",\"messages\":[") catch return;
+    out.print(",\"total\":{d},\"limit\":{d},\"offset\":{d},\"messages\":[", .{ total, limit, offset }) catch return;
     for (messages, 0..) |m, idx| {
         if (idx > 0) out.writeAll(",") catch return;
         out.writeAll("{\"role\":") catch return;
@@ -3302,6 +3383,14 @@ test "parsePositiveUsize accepts only positive integers" {
     try std.testing.expect(parsePositiveUsize("0") == null);
     try std.testing.expect(parsePositiveUsize("-1") == null);
     try std.testing.expect(parsePositiveUsize("bad") == null);
+}
+
+test "parseNonNegativeUsize accepts zero and positive integers" {
+    try std.testing.expectEqual(@as(?usize, 0), parseNonNegativeUsize("0"));
+    try std.testing.expectEqual(@as(?usize, 1), parseNonNegativeUsize("1"));
+    try std.testing.expectEqual(@as(?usize, 42), parseNonNegativeUsize("42"));
+    try std.testing.expect(parseNonNegativeUsize("-1") == null);
+    try std.testing.expect(parseNonNegativeUsize("bad") == null);
 }
 
 test "hasJsonFlag detects --json" {
