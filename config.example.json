@@ -200,6 +200,14 @@
     "require_pairing": true
   },
 
+  "a2a": {
+    "enabled": false,
+    "name": "NullClaw",
+    "description": "AI assistant",
+    "url": "https://agent.example.com",
+    "version": "1.0.0"
+  },
+
   "security": {
     "sandbox": {
       "backend": "auto"

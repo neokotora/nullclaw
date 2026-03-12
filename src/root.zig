@@ -49,6 +49,7 @@ pub const bootstrap = @import("bootstrap/root.zig");
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");
 pub const channels = @import("channels/root.zig");
+pub const a2a = @import("a2a.zig");
 
 // Phase 4: Extensions
 pub const security = @import("security/root.zig");

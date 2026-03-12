@@ -1586,6 +1586,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // A2A (Agent-to-Agent protocol)
+    if (root.get("a2a")) |a2a| {
+        if (a2a == .object) {
+            if (a2a.object.get("enabled")) |v| {
+                if (v == .bool) self.a2a.enabled = v.bool;
+            }
+            if (a2a.object.get("name")) |v| {
+                if (v == .string) self.a2a.name = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("description")) |v| {
+                if (v == .string) self.a2a.description = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("url")) |v| {
+                if (v == .string) self.a2a.url = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("version")) |v| {
+                if (v == .string) self.a2a.version = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
     // Identity
     if (root.get("identity")) |id| {
         if (id == .object) {

@@ -1104,6 +1104,16 @@ pub const GatewayConfig = struct {
     paired_tokens: []const []const u8 = &.{},
 };
 
+// ── A2A (Agent-to-Agent) protocol config ────────────────────────
+
+pub const A2aConfig = struct {
+    enabled: bool = false,
+    name: []const u8 = "NullClaw",
+    description: []const u8 = "AI assistant",
+    url: []const u8 = "",
+    version: []const u8 = "1.0.0",
+};
+
 // ── Composio config ─────────────────────────────────────────────
 
 pub const ComposioConfig = struct {
