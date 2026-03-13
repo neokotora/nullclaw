@@ -801,7 +801,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
+    try scaffoldWorkspaceForConfig(allocator, &cfg, &ProjectContext{});
 
     // Save config so subsequent commands can find it
     try cfg.save();
@@ -1940,7 +1940,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
+    try scaffoldWorkspaceForConfig(allocator, &cfg, &ProjectContext{});
 
     // Save config
     try cfg.save();
@@ -2113,6 +2113,33 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
 /// Create essential workspace files if they don't already exist.
 /// When a `bootstrap_provider` is supplied and the backend does not use
 /// files, documents are written through the provider instead of to disk.
+pub fn scaffoldWorkspaceForConfig(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    ctx: *const ProjectContext,
+) !void {
+    var scaffold_mem_rt: ?memory_root.MemoryRuntime = null;
+    defer if (scaffold_mem_rt) |*rt| rt.deinit();
+
+    const needs_bootstrap_runtime = !bootstrap_mod.backendUsesFiles(cfg.memory.backend) and
+        !std.mem.eql(u8, cfg.memory.backend, "none") and
+        !std.mem.eql(u8, cfg.memory.backend, "memory");
+    if (needs_bootstrap_runtime) {
+        scaffold_mem_rt = memory_root.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+    }
+
+    const scaffold_mem: ?memory_root.Memory = if (scaffold_mem_rt) |rt| rt.memory else null;
+    const bootstrap_provider = bootstrap_mod.createProvider(
+        allocator,
+        cfg.memory.backend,
+        scaffold_mem,
+        cfg.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
+
+    try scaffoldWorkspace(allocator, cfg.workspace_dir, ctx, bootstrap_provider);
+}
+
 pub fn scaffoldWorkspace(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
@@ -2158,7 +2185,7 @@ pub fn scaffoldWorkspace(
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
-    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content);
+    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content, bootstrap_provider);
 }
 
 pub const ResetWorkspacePromptFilesOptions = struct {
@@ -2216,16 +2243,18 @@ pub fn resetWorkspacePromptFiles(
     for (files) |entry| {
         if (bootstrap_provider) |bp| {
             if (!options.dry_run) try bp.store(entry.filename, entry.content);
+        } else {
+            _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
         }
-        _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
         report.rewritten_files += 1;
     }
 
     if (options.include_bootstrap) {
         if (bootstrap_provider) |bp| {
             if (!options.dry_run) try bp.store("BOOTSTRAP.md", bootstrapTemplate());
+        } else {
+            _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
         }
-        _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
         report.rewritten_files += 1;
     }
 
@@ -2301,8 +2330,9 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
 }
 
 /// Write-if-missing with optional BootstrapProvider routing.
-/// When a provider is set, stores the content through the provider as well
-/// (the file write still happens so file-based backends stay consistent).
+/// When a provider is set, stores the content through the provider only.
+/// File-based providers (hybrid/markdown) write to disk themselves;
+/// memory-based providers (sqlite, postgres, …) store in the backend.
 fn storeOrWriteIfMissing(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -2314,6 +2344,7 @@ fn storeOrWriteIfMissing(
         if (!provider.exists(filename)) {
             try provider.store(filename, content);
         }
+        return;
     }
     try writeIfMissing(allocator, dir, filename, content);
 }
@@ -2324,6 +2355,7 @@ fn ensureBootstrapLifecycle(
     identity_template: []const u8,
     user_template: []const u8,
     had_legacy_user_content: bool,
+    bp: ?bootstrap_mod.BootstrapProvider,
 ) !void {
     const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
@@ -2331,7 +2363,7 @@ fn ensureBootstrapLifecycle(
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
     defer state.deinit(allocator);
     var state_dirty = false;
-    var bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+    var bootstrap_exists = if (bp) |provider| provider.exists("BOOTSTRAP.md") else fileExistsAbsolute(bootstrap_path);
 
     if (state.bootstrap_seeded_at == null and bootstrap_exists) {
         try markBootstrapSeededAt(allocator, &state);
@@ -2355,8 +2387,8 @@ fn ensureBootstrapLifecycle(
             try markOnboardingCompletedAt(allocator, &state);
             state_dirty = true;
         } else {
-            try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate());
-            bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+            try storeOrWriteIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), bp);
+            bootstrap_exists = if (bp) |provider| provider.exists("BOOTSTRAP.md") else fileExistsAbsolute(bootstrap_path);
             if (bootstrap_exists and state.bootstrap_seeded_at == null) {
                 try markBootstrapSeededAt(allocator, &state);
                 state_dirty = true;
@@ -3108,6 +3140,182 @@ test "scaffoldWorkspace handles trailing native separator on Windows paths" {
 
     const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
+}
+
+test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = try allocator.dupe(u8, base),
+        .config_path = try std.fs.path.join(allocator, &.{ base, "config.json" }),
+        .allocator = allocator,
+    };
+    cfg.memory.backend = "sqlite";
+
+    try scaffoldWorkspaceForConfig(std.testing.allocator, &cfg, &ProjectContext{});
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("AGENTS.md", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    var mem_rt = memory_root.initRuntime(std.testing.allocator, &cfg.memory, cfg.workspace_dir) orelse
+        return error.TestUnexpectedResult;
+    defer mem_rt.deinit();
+
+    const bootstrap_provider = try bootstrap_mod.createProvider(
+        std.testing.allocator,
+        cfg.memory.backend,
+        mem_rt.memory,
+        cfg.workspace_dir,
+    );
+    defer bootstrap_provider.deinit();
+
+    const agents_content = try bootstrap_provider.load(std.testing.allocator, "AGENTS.md") orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(agents_content);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+
+    const bootstrap_content = try bootstrap_provider.load(std.testing.allocator, "BOOTSTRAP.md") orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(bootstrap_content);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap_content, "BOOTSTRAP.md - Hello, World") != null);
+}
+
+test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touching workspace markdown files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "AGENTS.md",
+        .data = "disk-agents-before",
+    });
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem_rt = memory_root.initRuntime(std.testing.allocator, &.{ .backend = "sqlite" }, base) orelse
+        return error.TestUnexpectedResult;
+    defer mem_rt.deinit();
+
+    const bootstrap_provider = try bootstrap_mod.createProvider(
+        std.testing.allocator,
+        "sqlite",
+        mem_rt.memory,
+        base,
+    );
+    defer bootstrap_provider.deinit();
+
+    const report = try resetWorkspacePromptFiles(
+        std.testing.allocator,
+        base,
+        &ProjectContext{},
+        .{ .include_bootstrap = true },
+        bootstrap_provider,
+    );
+    try std.testing.expectEqual(@as(usize, 7), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 0), report.removed_files);
+
+    const disk_agents = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
+    defer std.testing.allocator.free(disk_agents);
+    try std.testing.expectEqualStrings("disk-agents-before", disk_agents);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    const stored_agents = try bootstrap_provider.load(std.testing.allocator, "AGENTS.md") orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(stored_agents);
+    try std.testing.expect(std.mem.indexOf(u8, stored_agents, "AGENTS.md - Your Workspace") != null);
+
+    const stored_bootstrap = try bootstrap_provider.load(std.testing.allocator, "BOOTSTRAP.md") orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(stored_bootstrap);
+    try std.testing.expect(std.mem.indexOf(u8, stored_bootstrap, "BOOTSTRAP.md - Hello, World") != null);
+}
+
+test "bootstrap lifecycle stays equivalent across markdown hybrid and sqlite backends" {
+    const backends = [_][]const u8{ "markdown", "hybrid", "sqlite" };
+    var expected_agents: ?[]u8 = null;
+    defer if (expected_agents) |value| std.testing.allocator.free(value);
+    var expected_bootstrap: ?[]u8 = null;
+    defer if (expected_bootstrap) |value| std.testing.allocator.free(value);
+
+    for (backends) |backend| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(workspace);
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
+        var cfg = Config{
+            .workspace_dir = try allocator.dupe(u8, workspace),
+            .config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" }),
+            .allocator = allocator,
+        };
+        cfg.memory.backend = backend;
+
+        try scaffoldWorkspaceForConfig(std.testing.allocator, &cfg, &ProjectContext{});
+
+        var state = try readWorkspaceOnboardingState(std.testing.allocator, workspace);
+        defer state.deinit(std.testing.allocator);
+        try std.testing.expect(state.bootstrap_seeded_at != null);
+        try std.testing.expect(state.onboarding_completed_at == null);
+
+        var mem_rt: ?memory_root.MemoryRuntime = null;
+        defer if (mem_rt) |*rt| rt.deinit();
+        if (!bootstrap_mod.backendUsesFiles(backend)) {
+            mem_rt = memory_root.initRuntime(std.testing.allocator, &cfg.memory, workspace) orelse
+                return error.TestUnexpectedResult;
+        }
+
+        const mem_iface: ?memory_root.Memory = if (mem_rt) |rt| rt.memory else null;
+        const bootstrap_provider = try bootstrap_mod.createProvider(
+            std.testing.allocator,
+            backend,
+            mem_iface,
+            workspace,
+        );
+        defer bootstrap_provider.deinit();
+
+        try std.testing.expect(bootstrap_provider.exists("AGENTS.md"));
+        try std.testing.expect(bootstrap_provider.exists("BOOTSTRAP.md"));
+
+        const agents_content = try bootstrap_provider.load(std.testing.allocator, "AGENTS.md") orelse
+            return error.TestUnexpectedResult;
+        defer std.testing.allocator.free(agents_content);
+        const bootstrap_content = try bootstrap_provider.load(std.testing.allocator, "BOOTSTRAP.md") orelse
+            return error.TestUnexpectedResult;
+        defer std.testing.allocator.free(bootstrap_content);
+
+        if (expected_agents) |value| {
+            try std.testing.expectEqualStrings(value, agents_content);
+        } else {
+            expected_agents = try std.testing.allocator.dupe(u8, agents_content);
+        }
+        if (expected_bootstrap) |value| {
+            try std.testing.expectEqualStrings(value, bootstrap_content);
+        } else {
+            expected_bootstrap = try std.testing.allocator.dupe(u8, bootstrap_content);
+        }
+
+        try std.testing.expect(try bootstrap_provider.remove("BOOTSTRAP.md"));
+        try scaffoldWorkspaceForConfig(std.testing.allocator, &cfg, &ProjectContext{});
+
+        try std.testing.expect(!bootstrap_provider.exists("BOOTSTRAP.md"));
+
+        var completed_state = try readWorkspaceOnboardingState(std.testing.allocator, workspace);
+        defer completed_state.deinit(std.testing.allocator);
+        try std.testing.expect(completed_state.onboarding_completed_at != null);
+    }
 }
 
 // ── Additional onboard tests ────────────────────────────────────

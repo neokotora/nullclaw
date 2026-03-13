@@ -1175,7 +1175,7 @@ fn buildStreamingChatRequestBody(
         }
     }
 
-    try buf.appendSlice(allocator, ",\"stream\":true}");
+    try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -1787,6 +1787,7 @@ test "buildStreamingChatRequestBody contains stream true" {
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
 }
 
 test "buildStreamingChatRequestBody omits provider thinking params when reasoning_effort none" {

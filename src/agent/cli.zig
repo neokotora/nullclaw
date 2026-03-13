@@ -183,10 +183,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     };
 
-    // Ensure lifecycle parity: seed workspace files on first agent run
-    // so prompts always have the expected bootstrap context.
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{}, null);
-
     var out_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&out_buf);
     const w = &bw.interface;
@@ -253,6 +249,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         cfg.workspace_dir,
     ) catch null;
     defer if (bootstrap_provider) |bp| bp.deinit();
+
+    // Ensure lifecycle parity: seed workspace files on first agent run
+    // so prompts always have the expected bootstrap context.
+    try onboard.scaffoldWorkspace(
+        allocator,
+        cfg.workspace_dir,
+        &onboard.ProjectContext{},
+        bootstrap_provider,
+    );
 
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
