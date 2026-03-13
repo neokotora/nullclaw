@@ -14,12 +14,6 @@ pub fn readFileAlloc(dir: std.fs.Dir, allocator: std.mem.Allocator, sub_path: []
     return try file.readToEndAlloc(allocator, capped_read_limit(max_bytes));
 }
 
-pub fn readAbsoluteFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: u64) ![]u8 {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, capped_read_limit(max_bytes));
-}
-
 /// Compatibility wrapper for `File.stat()` that uses `fstat` on POSIX
 /// platforms instead of the Linux `statx` fast path in Zig 0.15.2.
 pub fn stat(file: std.fs.File) std.fs.File.StatError!std.fs.File.Stat {

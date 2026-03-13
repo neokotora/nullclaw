@@ -142,7 +142,9 @@ zig build -Doptimize=ReleaseSmall
 
 - 必须使用 **Zig 0.15.2**
 - 如果 `zig build` 一开始就失败，先确认 Zig 版本
+- Termux 原生构建使用当前环境的 native target，通常不需要手动传 `-Dtarget`
 - 在 Android / Termux 上，建议先跑前台命令（如 `agent`、`gateway`），确认没问题后再考虑后台托管
+- 官方 release 提供 `aarch64`、`armv7`、`x86_64` 的 Android / Termux 预构建二进制
 
 ### 为 Android 交叉编译
 
@@ -157,6 +159,8 @@ zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall
 - `aarch64-linux-android.24`
 - `arm-linux-androideabi.24`，配合 `-Dcpu=baseline+v7a`
 - `x86_64-linux-android.24`
+
+选择与目标手机或模拟器架构匹配的 target。官方 release 也附带基于 Android API 24 构建的对应二进制。
 
 ## 将二进制加入 PATH
 

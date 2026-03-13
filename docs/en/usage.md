@@ -63,6 +63,8 @@ nullclaw gateway
 | `nullclaw channel start telegram` | Start a specific channel |
 | `nullclaw migrate openclaw --dry-run` | Dry-run OpenClaw migration |
 | `nullclaw migrate openclaw` | Execute OpenClaw migration |
+| `nullclaw history list [--json]` | List conversation sessions |
+| `nullclaw history show <session_id> [--json]` | Show messages for a session |
 
 ## Service Mode Recommendations
 

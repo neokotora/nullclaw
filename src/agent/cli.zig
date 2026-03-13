@@ -21,7 +21,7 @@ const subagent_mod = @import("../subagent.zig");
 const subagent_runner = @import("../subagent_runner.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
-const auth_mod = @import("../auth.zig");
+const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
@@ -56,14 +56,7 @@ fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
 }
 
 fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
-    const token = auth_mod.loadCredential(allocator, providers.openai_codex.CREDENTIAL_KEY) catch return false;
-    if (token) |tok| {
-        allocator.free(tok.access_token);
-        if (tok.refresh_token) |rt| allocator.free(rt);
-        allocator.free(tok.token_type);
-        return true;
-    }
-    return false;
+    return codex_support.hasOpenAiCodexCredential(allocator);
 }
 
 fn shouldPrintOpenAiCodexHint(default_provider: []const u8, has_codex_credential: bool) bool {
@@ -77,8 +70,8 @@ fn maybePrintAllProvidersFailedHint(
 ) !void {
     if (!shouldPrintOpenAiCodexHint(default_provider, hasOpenAiCodexCredential(allocator))) return;
     try w.print(
-        "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" or run with --provider openai-codex --model gpt-5.3-codex.\n",
-        .{default_provider},
+        "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/{s}\" or run with --provider openai-codex --model {s}.\n",
+        .{ default_provider, codex_support.DEFAULT_CODEX_MODEL, codex_support.DEFAULT_CODEX_MODEL },
     );
 }
 

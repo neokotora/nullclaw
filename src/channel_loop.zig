@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Config = @import("config.zig").Config;
+const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
 const session_mod = @import("session.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -25,6 +26,7 @@ const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
+const agent_bindings_config = @import("agent_bindings_config.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -70,10 +72,260 @@ const TelegramSessionMapEntry = struct {
     turn_running: bool,
 };
 
+const TELEGRAM_BINDING_COMMENT = "Managed by Telegram /bind";
+
 fn currentTelegramSessionTarget(sender: []const u8) TelegramSessionTarget {
     return .{
         .base_chat_id = telegram.targetChatId(sender),
         .thread_id = telegram.targetThreadId(sender),
+    };
+}
+
+fn currentTelegramBindingPeerId(
+    allocator: std.mem.Allocator,
+    sender: []const u8,
+    is_group: bool,
+) ![]u8 {
+    if (!is_group) return allocator.dupe(u8, sender);
+
+    const base_chat_id = telegram.targetChatId(sender);
+    if (telegram.targetThreadId(sender)) |thread_id| {
+        return std.fmt.allocPrint(allocator, "{s}:thread:{d}", .{ base_chat_id, thread_id });
+    }
+    return allocator.dupe(u8, base_chat_id);
+}
+
+fn currentTelegramBindingKind(is_group: bool) agent_routing.ChatType {
+    return if (is_group) .group else .direct;
+}
+
+fn telegramBindingTargetLabel(is_group: bool, thread_id: ?i64) []const u8 {
+    if (!is_group) return "direct chat";
+    if (thread_id != null) return "forum topic";
+    return "group chat";
+}
+
+fn matchedByLabel(matched_by: agent_routing.MatchedBy) []const u8 {
+    return switch (matched_by) {
+        .peer => "peer",
+        .parent_peer => "parent_peer",
+        .guild_roles => "guild_roles",
+        .guild => "guild",
+        .team => "team",
+        .account => "account",
+        .channel_only => "channel_only",
+        .default => "default",
+    };
+}
+
+pub fn buildTelegramBindingStatusReply(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    sender: []const u8,
+    is_group: bool,
+) ![]u8 {
+    const base_chat_id = if (is_group) telegram.targetChatId(sender) else sender;
+    const thread_id = if (is_group) telegram.targetThreadId(sender) else null;
+    const peer_kind = currentTelegramBindingKind(is_group);
+    const binding_label = telegramBindingTargetLabel(is_group, thread_id);
+    const peer_id = try currentTelegramBindingPeerId(allocator, sender, is_group);
+    defer allocator.free(peer_id);
+
+    const current_target = agent_bindings_config.BindingTarget{
+        .channel = "telegram",
+        .account_id = account_id,
+        .peer = .{
+            .kind = peer_kind,
+            .id = peer_id,
+        },
+    };
+    const exact_binding = agent_bindings_config.findExactPeerBinding(config.agent_bindings, current_target);
+    const inherited_binding = agent_bindings_config.findInheritedPeerBinding(config.agent_bindings, current_target);
+
+    const route = try agent_routing.resolveRoute(allocator, .{
+        .channel = "telegram",
+        .account_id = account_id,
+        .peer = .{
+            .kind = peer_kind,
+            .id = peer_id,
+        },
+        .parent_peer = if (is_group and thread_id != null)
+            .{
+                .kind = peer_kind,
+                .id = base_chat_id,
+            }
+        else
+            null,
+    }, config.agent_bindings, config.agents);
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const writer = out.writer(allocator);
+
+    try writer.writeAll("Telegram binding status\n");
+    try writer.print("Account: {s}\n", .{account_id});
+    try writer.print("Target: {s} {s}\n", .{ binding_label, peer_id });
+    if (thread_id) |tid| {
+        try writer.print("Thread: {d}\n", .{tid});
+    }
+    try writer.print("Effective agent: {s}", .{route.agent_id});
+    if (agent_bindings_config.agentDisplayNameForId(config.agents, route.agent_id)) |display_name| {
+        try writer.print(" ({s})", .{display_name});
+    }
+    try writer.writeAll("\n");
+    try writer.print("Matched by: {s}\n", .{matchedByLabel(route.matched_by)});
+    if (exact_binding) |binding| {
+        try writer.print("Exact binding: {s}\n", .{binding.binding.agent_id});
+    } else {
+        try writer.writeAll("Exact binding: none\n");
+    }
+    if (inherited_binding) |binding| {
+        try writer.print("Inherited peer binding: {s}\n", .{binding.binding.agent_id});
+    } else {
+        try writer.writeAll("Inherited peer binding: none\n");
+    }
+
+    if (config.agents.len == 0) {
+        try writer.print("Named agents: none configured in {s}\n", .{config.config_path});
+    } else {
+        try writer.writeAll("Available named agents:\n");
+        for (config.agents) |agent_profile| {
+            var agent_buf: [64]u8 = undefined;
+            const agent_id = agent_routing.normalizeId(&agent_buf, agent_profile.name);
+            try writer.print("- {s} (id: {s}, model: {s}/{s})\n", .{
+                agent_profile.name,
+                agent_id,
+                agent_profile.provider,
+                agent_profile.model,
+            });
+        }
+    }
+    try writer.writeAll("Usage: /bind <agent>, /bind clear, /bind status");
+
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn applyTelegramBindingCommand(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    account_id: []const u8,
+    sender: []const u8,
+    is_group: bool,
+    arg: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, arg, " \t\r\n");
+    if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "status") or std.ascii.eqlIgnoreCase(trimmed, "help")) {
+        return buildTelegramBindingStatusReply(allocator, config, account_id, sender, is_group);
+    }
+
+    const thread_id = if (is_group) telegram.targetThreadId(sender) else null;
+    const binding_label = telegramBindingTargetLabel(is_group, thread_id);
+    const peer_id = try currentTelegramBindingPeerId(allocator, sender, is_group);
+    defer allocator.free(peer_id);
+
+    const binding_target = agent_bindings_config.BindingTarget{
+        .channel = "telegram",
+        .account_id = account_id,
+        .peer = .{
+            .kind = currentTelegramBindingKind(is_group),
+            .id = peer_id,
+        },
+        .comment = TELEGRAM_BINDING_COMMENT,
+    };
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "clear")) {
+        const persisted = try agent_bindings_config.persistBindingUpdate(allocator, config.config_path, binding_target, null);
+        const live_applied = blk: {
+            const live_cfg = @constCast(config);
+            _ = agent_bindings_config.applyBindingUpdate(live_cfg.allocator, live_cfg, binding_target, null) catch break :blk false;
+            break :blk true;
+        };
+
+        return switch (persisted.status) {
+            .removed => std.fmt.allocPrint(
+                allocator,
+                "Cleared the exact binding for this {s}. {s}",
+                .{
+                    binding_label,
+                    if (live_applied)
+                        "Next message here will use the fallback route."
+                    else
+                        "Saved to config; restart is required for this runtime to pick it up.",
+                },
+            ),
+            .unchanged => std.fmt.allocPrint(allocator, "No exact binding is stored for this {s}.", .{binding_label}),
+            else => std.fmt.allocPrint(allocator, "Cleared the exact binding for this {s}.", .{binding_label}),
+        };
+    }
+
+    if (config.agents.len == 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "No named agents are configured yet. Add them under agents.list in {s} first.",
+            .{config.config_path},
+        );
+    }
+
+    const selected_agent = agent_bindings_config.findNamedAgent(config.agents, trimmed) orelse {
+        const status = try buildTelegramBindingStatusReply(allocator, config, account_id, sender, is_group);
+        defer allocator.free(status);
+        return std.fmt.allocPrint(
+            allocator,
+            "Unknown agent '{s}'.\n\n{s}",
+            .{ trimmed, status },
+        );
+    };
+
+    var agent_buf: [64]u8 = undefined;
+    const selected_agent_id = agent_routing.normalizeId(&agent_buf, selected_agent.name);
+
+    const persisted = try agent_bindings_config.persistBindingUpdate(allocator, config.config_path, binding_target, selected_agent.name);
+    const live_applied = blk: {
+        const live_cfg = @constCast(config);
+        _ = agent_bindings_config.applyBindingUpdate(live_cfg.allocator, live_cfg, binding_target, selected_agent.name) catch break :blk false;
+        break :blk true;
+    };
+
+    return switch (persisted.status) {
+        .added => std.fmt.allocPrint(
+            allocator,
+            "Bound this {s} to agent \"{s}\" (id: {s}). {s}",
+            .{
+                binding_label,
+                selected_agent.name,
+                selected_agent_id,
+                if (live_applied)
+                    "Next message here will start or resume that routed session."
+                else
+                    "Saved to config; restart is required for this runtime to pick it up.",
+            },
+        ),
+        .updated => std.fmt.allocPrint(
+            allocator,
+            "Updated this {s} binding to agent \"{s}\" (id: {s}). {s}",
+            .{
+                binding_label,
+                selected_agent.name,
+                selected_agent_id,
+                if (live_applied)
+                    "Next message here will start or resume that routed session."
+                else
+                    "Saved to config; restart is required for this runtime to pick it up.",
+            },
+        ),
+        .unchanged => std.fmt.allocPrint(
+            allocator,
+            "This {s} is already bound to agent \"{s}\" (id: {s}).",
+            .{ binding_label, selected_agent.name, selected_agent_id },
+        ),
+        .removed => std.fmt.allocPrint(
+            allocator,
+            "Updated this {s} binding to agent \"{s}\" (id: {s}).",
+            .{ binding_label, selected_agent.name, selected_agent_id },
+        ),
     };
 }
 
@@ -124,18 +376,46 @@ fn resolveTelegramBaseRouteKey(
     config: *const Config,
     account_id: []const u8,
     peer_id: []const u8,
+    thread_id: ?i64,
     is_group: bool,
 ) ![]const u8 {
-    const route = try agent_routing.resolveRouteWithSession(allocator, .{
+    const peer_kind: agent_routing.ChatType = if (is_group) .group else .direct;
+    var topic_peer_id: ?[]u8 = null;
+    defer if (topic_peer_id) |owned| allocator.free(owned);
+
+    const route = try agent_routing.resolveRoute(allocator, .{
         .channel = "telegram",
         .account_id = account_id,
         .peer = .{
-            .kind = if (is_group) .group else .direct,
+            .kind = peer_kind,
+            .id = if (is_group and thread_id != null) blk: {
+                topic_peer_id = try std.fmt.allocPrint(allocator, "{s}:thread:{d}", .{ peer_id, thread_id.? });
+                break :blk topic_peer_id.?;
+            } else peer_id,
+        },
+        .parent_peer = if (is_group and thread_id != null)
+            .{
+                .kind = peer_kind,
+                .id = peer_id,
+            }
+        else
+            null,
+    }, config.agent_bindings, config.agents);
+    defer allocator.free(route.session_key);
+    allocator.free(route.main_session_key);
+
+    return agent_routing.buildSessionKeyWithScope(
+        allocator,
+        route.agent_id,
+        "telegram",
+        .{
+            .kind = peer_kind,
             .id = peer_id,
         },
-    }, config.agent_bindings, config.agents, config.session);
-    allocator.free(route.main_session_key);
-    return route.session_key;
+        config.session.dm_scope,
+        account_id,
+        config.session.identity_links,
+    );
 }
 
 fn buildTelegramFallbackSessionKey(
@@ -173,6 +453,14 @@ fn buildThreadedSessionKeyIfNeeded(
     return base_key;
 }
 
+fn buildLegacyTelegramTopicSessionKey(
+    allocator: std.mem.Allocator,
+    base_key: []const u8,
+    thread_id: i64,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}#topic:{d}", .{ base_key, thread_id });
+}
+
 pub fn resolveTelegramSessionKey(
     allocator: std.mem.Allocator,
     session_mgr: *session_mod.SessionManager,
@@ -184,16 +472,17 @@ pub fn resolveTelegramSessionKey(
     const base_peer_id = if (is_group) telegram.targetChatId(sender) else sender;
     const thread_id = if (is_group) telegram.targetThreadId(sender) else null;
 
-    const canonical_base = resolveTelegramBaseRouteKey(allocator, config, account_id, base_peer_id, is_group) catch
+    const canonical_base = resolveTelegramBaseRouteKey(allocator, config, account_id, base_peer_id, thread_id, is_group) catch
         try buildTelegramFallbackSessionKey(allocator, account_id, base_peer_id, null);
+    const legacy_key: ?[]u8 = if (thread_id) |tid|
+        try buildLegacyTelegramTopicSessionKey(allocator, canonical_base, tid)
+    else
+        null;
+    defer if (legacy_key) |key| allocator.free(key);
+
     const canonical_key = try buildThreadedSessionKeyIfNeeded(allocator, canonical_base, thread_id);
 
-    if (thread_id != null) {
-        const legacy_key = resolveTelegramBaseRouteKey(allocator, config, account_id, sender, is_group) catch
-            try buildTelegramFallbackSessionKey(allocator, account_id, sender, null);
-        defer allocator.free(legacy_key);
-        session_mgr.migrateLegacySessionKey(canonical_key, legacy_key);
-    }
+    if (legacy_key) |key| session_mgr.migrateLegacySessionKey(canonical_key, key);
 
     return canonical_key;
 }
@@ -308,12 +597,14 @@ fn sendTelegramStartGreeting(
 fn handleTelegramBuiltinCommand(
     allocator: std.mem.Allocator,
     session_mgr: *session_mod.SessionManager,
+    config: *const Config,
     tg_ptr: *telegram.TelegramChannel,
     content: []const u8,
     sender: []const u8,
     sender_identity: []const u8,
     first_name: ?[]const u8,
     model: []const u8,
+    is_group: bool,
     reply_to_id: ?i64,
     message_id: ?i64,
 ) bool {
@@ -321,6 +612,37 @@ fn handleTelegramBuiltinCommand(
 
     if (control_plane.isSlashName(cmd, "start")) {
         sendTelegramStartGreeting(tg_ptr, sender, first_name, sender_identity, model, reply_to_id);
+        return true;
+    }
+
+    if (control_plane.isSlashName(cmd, "bind")) {
+        tg_ptr.setTaskReaction(sender, message_id, .accepted);
+
+        if (!tg_ptr.binding_commands_enabled) {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            tg_ptr.sendMessageWithReply(sender, "Binding commands are disabled for this Telegram account.", reply_to_id) catch |err| {
+                log.err("failed to send /bind disabled reply: {}", .{err});
+            };
+            return true;
+        }
+
+        tg_ptr.setTaskReaction(sender, message_id, .running);
+        const reply = applyTelegramBindingCommand(allocator, config, tg_ptr.account_id, sender, is_group, cmd.arg) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to handle /bind command: {}", .{err});
+            tg_ptr.sendMessageWithReply(sender, "Failed to update Telegram binding.", reply_to_id) catch |send_err| {
+                log.err("failed to send /bind error reply: {}", .{send_err});
+            };
+            return true;
+        };
+        defer allocator.free(reply);
+
+        tg_ptr.sendMessageWithReply(sender, reply, reply_to_id) catch |err| {
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to send /bind reply: {}", .{err});
+            return true;
+        };
+        tg_ptr.setTaskReaction(sender, message_id, .done);
         return true;
     }
 
@@ -950,12 +1272,14 @@ pub fn runTelegramLoop(
             if (handleTelegramBuiltinCommand(
                 allocator,
                 &runtime.session_mgr,
+                config,
                 tg_ptr,
                 msg.content,
                 msg.sender,
                 msg.id,
                 msg.first_name,
                 model,
+                msg.is_group,
                 reply_to_id,
                 msg.message_id,
             )) {
@@ -1691,6 +2015,114 @@ test "parseTelegramSessionTargetFromKey handles canonical telegram fallback thre
     const parsed = parseTelegramSessionTargetFromKey("telegram:main:-100123:thread:77") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("-100123", parsed.base_chat_id);
     try std.testing.expectEqual(@as(?i64, 77), parsed.thread_id);
+}
+
+test "resolveTelegramBaseRouteKey matches topic-specific telegram binding before group fallback" {
+    const allocator = std.testing.allocator;
+    const agents = [_]config_types.NamedAgentConfig{
+        .{ .name = "default", .provider = "openai", .model = "gpt-4" },
+        .{ .name = "group-agent", .provider = "openai", .model = "gpt-4" },
+        .{ .name = "topic-agent", .provider = "openai", .model = "gpt-4" },
+    };
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "group-agent",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123" },
+            },
+        },
+        .{
+            .agent_id = "topic-agent",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123:thread:77" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .agents = &agents,
+        .agent_bindings = &bindings,
+    };
+
+    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "-100123", 77, true);
+    defer allocator.free(key);
+
+    try std.testing.expectEqualStrings("agent:topic-agent:telegram:group:-100123", key);
+}
+
+test "resolveTelegramBaseRouteKey falls back to base telegram group binding for unmatched topic" {
+    const allocator = std.testing.allocator;
+    const agents = [_]config_types.NamedAgentConfig{
+        .{ .name = "default", .provider = "openai", .model = "gpt-4" },
+        .{ .name = "group-agent", .provider = "openai", .model = "gpt-4" },
+    };
+    const bindings = [_]agent_routing.AgentBinding{.{
+        .agent_id = "group-agent",
+        .match = .{
+            .channel = "telegram",
+            .account_id = "main",
+            .peer = .{ .kind = .group, .id = "-100123" },
+        },
+    }};
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .agents = &agents,
+        .agent_bindings = &bindings,
+    };
+
+    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "-100123", 77, true);
+    defer allocator.free(key);
+
+    try std.testing.expectEqualStrings("agent:group-agent:telegram:group:-100123", key);
+}
+
+test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bindings" {
+    const allocator = std.testing.allocator;
+    const agents = [_]config_types.NamedAgentConfig{
+        .{ .name = "default", .provider = "openai", .model = "gpt-4" },
+        .{ .name = "reviewer", .provider = "openai", .model = "gpt-4" },
+        .{ .name = "coder", .provider = "openai", .model = "gpt-4" },
+    };
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "reviewer",
+            .match = .{
+                .channel = "telegram",
+                .peer = .{ .kind = .group, .id = "-100123:thread:77" },
+            },
+        },
+        .{
+            .agent_id = "coder",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123:thread:77" },
+            },
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/nullclaw",
+        .config_path = "/tmp/nullclaw/config.json",
+        .allocator = allocator,
+        .agents = &agents,
+        .agent_bindings = &bindings,
+    };
+
+    const reply = try buildTelegramBindingStatusReply(allocator, &cfg, "main", "-100123#topic:77", true);
+    defer allocator.free(reply);
+
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Effective agent: coder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Exact binding: coder") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Inherited peer binding: reviewer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: peer") != null);
 }
 
 test "telegram update offset store roundtrip" {

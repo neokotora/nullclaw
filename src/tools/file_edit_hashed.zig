@@ -10,25 +10,28 @@ const generateLineHash = @import("file_read_hashed.zig").generateLineHash;
 
 const RADIUS: usize = 50;
 
-fn findLineWithRadius(lines: []const LineInfo, hint_idx: usize, target_hash: []const u8) ?usize {
-    // 1. Try exact hint first
-    if (hint_idx < lines.len) {
-        const parent = if (hint_idx > 0) lines[hint_idx - 1].content else "";
-        const h = generateLineHash(parent, lines[hint_idx].content);
-        if (std.mem.eql(u8, &h, target_hash)) return hint_idx;
-    }
+const LineSearchResult = union(enum) {
+    found: usize,
+    not_found,
+    ambiguous,
+};
 
-    // 2. Search in radius
+fn findLineWithRadius(lines: []const LineInfo, hint_idx: usize, target_hash: []const u8) LineSearchResult {
     const start = if (hint_idx > RADIUS) hint_idx - RADIUS else 0;
     const end = @min(lines.len, hint_idx + RADIUS + 1);
+    var found_idx: ?usize = null;
 
     for (lines[start..end], start..) |line, i| {
         const parent = if (i > 0) lines[i - 1].content else "";
         const h = generateLineHash(parent, line.content);
-        if (std.mem.eql(u8, &h, target_hash)) return i;
+        if (std.mem.eql(u8, &h, target_hash)) {
+            if (found_idx != null) return .ambiguous;
+            found_idx = i;
+        }
     }
 
-    return null;
+    if (found_idx) |idx| return .{ .found = idx };
+    return .not_found;
 }
 
 /// Default maximum file size to read (10MB).
@@ -161,9 +164,16 @@ pub const FileEditHashedTool = struct {
         if (target.line_num == 0 or target.line_num > lines.items.len) return ToolResult.fail("Target line number out of range");
 
         // Find real start line using radius search
-        const real_start_idx = findLineWithRadius(lines.items, target.line_num - 1, target.hash) orelse {
-            const msg = try std.fmt.allocPrint(allocator, "Hash mismatch for start target {s} near line {d}. Context changed.", .{ target.hash, target.line_num });
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        const real_start_idx = switch (findLineWithRadius(lines.items, target.line_num - 1, target.hash)) {
+            .found => |idx| idx,
+            .not_found => {
+                const msg = try std.fmt.allocPrint(allocator, "Hash mismatch for start target {s} near line {d}. Context changed.", .{ target.hash, target.line_num });
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            },
+            .ambiguous => {
+                const msg = try std.fmt.allocPrint(allocator, "Ambiguous start target {s} near line {d}. Re-read file to refresh Hashlines.", .{ target.hash, target.line_num });
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            },
         };
 
         const real_end_idx = if (end_target) |et| blk: {
@@ -181,8 +191,11 @@ pub const FileEditHashedTool = struct {
             else
                 @as(usize, @intCast(hinted_i64));
 
-            const resolved_end = findLineWithRadius(lines.items, hint, et.hash) orelse
-                return ToolResult.fail("Hash mismatch for end target. Context changed.");
+            const resolved_end = switch (findLineWithRadius(lines.items, hint, et.hash)) {
+                .found => |idx| idx,
+                .not_found => return ToolResult.fail("Hash mismatch for end target. Context changed."),
+                .ambiguous => return ToolResult.fail("Ambiguous end target. Re-read file to refresh Hashlines."),
+            };
             if (resolved_end < real_start_idx) return ToolResult.fail("End target resolved before start target");
             break :blk resolved_end;
         } else real_start_idx;
@@ -241,6 +254,39 @@ test "file_edit_hashed replaces line when hash matches with shift" {
     const updated = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
     defer std.testing.allocator.free(updated);
     try std.testing.expect(std.mem.indexOf(u8, updated, "NEW LINE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "line two") == null);
+}
+
+test "file_edit_hashed rejects ambiguous collision during shift" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const content = "line one\nline two\nline three";
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = content });
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    const h2 = generateLineHash("line one", "line two");
+
+    // "bms" collides with the target hash when paired with "line one".
+    const shifted = "bms\nline one\nline two\nline three";
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = shifted });
+
+    var args_buf: [128]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"path\": \"test.txt\", \"target\": \"L2:{s}\", \"new_text\": \"NEW LINE\"}}", .{h2});
+
+    var ft = FileEditHashedTool{ .workspace_dir = ws_path };
+    const parsed = try root.parseTestArgs(args);
+    defer parsed.deinit();
+
+    const result = try ft.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Ambiguous start target") != null);
+
+    const updated = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "test.txt", 1024);
+    defer std.testing.allocator.free(updated);
+    try std.testing.expectEqualStrings(shifted, updated);
 }
 
 test "file_edit_hashed fails when hash mismatches" {

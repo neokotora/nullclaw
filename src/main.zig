@@ -2741,6 +2741,7 @@ fn sendStandaloneTelegramStartGreeting(
 
 fn handleStandaloneTelegramBuiltinCommand(
     allocator: std.mem.Allocator,
+    config: *const yc.config.Config,
     session_mgr: *yc.session.SessionManager,
     tg: *yc.channels.telegram.TelegramChannel,
     content: []const u8,
@@ -2748,6 +2749,7 @@ fn handleStandaloneTelegramBuiltinCommand(
     sender_identity: []const u8,
     first_name: ?[]const u8,
     model: []const u8,
+    is_group: bool,
     reply_to_id: ?i64,
     message_id: ?i64,
 ) bool {
@@ -2755,6 +2757,37 @@ fn handleStandaloneTelegramBuiltinCommand(
 
     if (control_plane.isSlashName(cmd, "start")) {
         sendStandaloneTelegramStartGreeting(tg, sender, first_name, sender_identity, model, reply_to_id);
+        return true;
+    }
+
+    if (control_plane.isSlashName(cmd, "bind")) {
+        tg.setTaskReaction(sender, message_id, .accepted);
+
+        if (!tg.binding_commands_enabled) {
+            tg.setTaskReaction(sender, message_id, .failed);
+            tg.sendMessageWithReply(sender, "Binding commands are disabled for this Telegram account.", reply_to_id) catch |err| {
+                log.err("failed to send /bind disabled reply: {}", .{err});
+            };
+            return true;
+        }
+
+        tg.setTaskReaction(sender, message_id, .running);
+        const reply = yc.channel_loop.applyTelegramBindingCommand(allocator, config, tg.account_id, sender, is_group, cmd.arg) catch |err| {
+            tg.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to handle /bind command: {}", .{err});
+            tg.sendMessageWithReply(sender, "Failed to update Telegram binding.", reply_to_id) catch |send_err| {
+                log.err("failed to send /bind error reply: {}", .{send_err});
+            };
+            return true;
+        };
+        defer allocator.free(reply);
+
+        tg.sendMessageWithReply(sender, reply, reply_to_id) catch |err| {
+            tg.setTaskReaction(sender, message_id, .failed);
+            log.err("failed to send /bind reply: {}", .{err});
+            return true;
+        };
+        tg.setTaskReaction(sender, message_id, .done);
         return true;
     }
 
@@ -2905,6 +2938,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     tg.streaming_enabled = telegram_config.streaming;
     tg.status_reactions_enabled = telegram_config.status_reactions;
     tg.reaction_emojis = telegram_config.reaction_emojis;
+    tg.binding_commands_enabled = telegram_config.binding_commands_enabled;
     tg.topic_commands_enabled = telegram_config.topic_commands_enabled;
     tg.topic_map_command_enabled = telegram_config.topic_map_command_enabled;
     tg.commands_menu_mode = telegram_config.commands_menu_mode;
@@ -3051,6 +3085,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
             if (handleStandaloneTelegramBuiltinCommand(
                 allocator,
+                &config,
                 &session_mgr,
                 &tg,
                 msg.content,
@@ -3058,6 +3093,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
                 msg.id,
                 msg.first_name,
                 model,
+                msg.is_group,
                 reply_to_id,
                 msg.message_id,
             )) {
@@ -3201,6 +3237,10 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             if (account_id) |id| {
                 std.debug.print("  Account: {s}\n", .{id});
             }
+        } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
+            std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
+            std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
+            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in ~/.nullclaw/auth.json.\n", .{});
         } else {
             std.debug.print("openai-codex: not authenticated\n", .{});
             std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
@@ -3425,7 +3465,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -3479,7 +3519,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" in ~/.nullclaw/config.json\n", .{});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 fn printUsage() void {

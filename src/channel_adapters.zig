@@ -69,6 +69,8 @@ pub const InboundMetadata = struct {
     thread_id: ?[]const u8 = null,
     is_dm: ?bool = null,
     is_group: ?bool = null,
+    sender_username: ?[]const u8 = null,
+    sender_display_name: ?[]const u8 = null,
 };
 
 pub const InboundRouteInput = struct {

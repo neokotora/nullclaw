@@ -174,7 +174,7 @@ Telegram 示例：
 
 ### `memory`
 
-- `backend`: 建议从 `sqlite` 开始。
+- `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
 - `auto_save`: 开启后会自动持久化会话记忆。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 

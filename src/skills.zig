@@ -240,6 +240,284 @@ fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+// ── Frontmatter Parsing ─────────────────────────────────────────
+//
+// SKILL.md files may contain YAML frontmatter — a `---`-delimited block at the
+// top of the file that carries manifest metadata (name, description, version,
+// author, always, requires_bins, requires_env).
+//
+// When a skill directory has only SKILL.md (no SKILL.toml / skill.json), the
+// frontmatter is parsed to populate SkillManifest fields.  The body (content
+// after the closing `---`) becomes the skill instructions.
+
+const FrontmatterSplit = struct {
+    /// Raw frontmatter text between the opening and closing `---` delimiters.
+    meta: []const u8,
+    /// Content after the closing `---` delimiter (the actual instructions).
+    body: []const u8,
+};
+
+/// Detect `---`-delimited frontmatter at the top of `content`.
+/// Returns the raw meta and body slices, or null if no valid frontmatter block.
+fn splitFrontmatter(content: []const u8) ?FrontmatterSplit {
+    // Must start with "---" followed by newline (or be exactly "---" for degenerate case).
+    if (content.len < 3) return null;
+    if (!std.mem.startsWith(u8, content, "---")) return null;
+
+    // The opening delimiter must be followed by a newline (or be the entire content).
+    const after_open = content[3..];
+    if (after_open.len == 0) return null; // just "---", no closing
+    if (after_open[0] != '\n' and after_open[0] != '\r') return null;
+
+    // Skip past the newline after opening "---"
+    var meta_start: usize = 3;
+    if (after_open[0] == '\r' and after_open.len > 1 and after_open[1] == '\n') {
+        meta_start += 2;
+    } else {
+        meta_start += 1;
+    }
+
+    // Find closing "---" on its own line.
+    const meta_content = content[meta_start..];
+    var pos: usize = 0;
+    while (pos < meta_content.len) {
+        // Check if current position starts a line with "---"
+        if (std.mem.startsWith(u8, meta_content[pos..], "---")) {
+            const after_close = meta_content[pos + 3 ..];
+            // Closing "---" must be followed by newline or EOF
+            if (after_close.len == 0 or after_close[0] == '\n' or after_close[0] == '\r') {
+                const meta = meta_content[0..pos];
+                var body_start = meta_start + pos + 3;
+                // Skip past the newline after closing "---"
+                if (body_start < content.len and content[body_start] == '\r') body_start += 1;
+                if (body_start < content.len and content[body_start] == '\n') body_start += 1;
+                return FrontmatterSplit{
+                    .meta = meta,
+                    .body = if (body_start < content.len) content[body_start..] else "",
+                };
+            }
+        }
+        // Advance to start of next line
+        while (pos < meta_content.len and meta_content[pos] != '\n') : (pos += 1) {}
+        if (pos < meta_content.len) pos += 1; // skip '\n'
+    }
+    return null;
+}
+
+/// Extract a simple `key: value` string from YAML-subset frontmatter lines.
+/// Handles bare values, single-quoted, and double-quoted values.
+/// Returns a slice into the `meta` buffer — caller must dupe.
+fn parseFrontmatterField(meta: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, meta, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, "\r \t");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        // Find the colon separator
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const candidate_key = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+        const raw_value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (raw_value.len == 0) return "";
+
+        // Strip inline comment (respecting quotes)
+        const uncommented = stripFrontmatterInlineComment(raw_value);
+        const value = std.mem.trim(u8, uncommented, " \t");
+        if (value.len == 0) return "";
+
+        // Quoted string
+        if (value.len >= 2) {
+            const q = value[0];
+            if (q == '"' or q == '\'') {
+                if (value[value.len - 1] == q) {
+                    return value[1 .. value.len - 1];
+                }
+            }
+        }
+
+        // Bare value
+        return value;
+    }
+    return null;
+}
+
+/// Strip inline `#` comments from a YAML value, respecting quoted strings.
+fn stripFrontmatterInlineComment(value: []const u8) []const u8 {
+    var in_single = false;
+    var in_double = false;
+
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        const c = value[i];
+        if (c == '"' and !in_single) {
+            in_double = !in_double;
+            continue;
+        }
+        if (c == '\'' and !in_double) {
+            in_single = !in_single;
+            continue;
+        }
+        // In YAML, `#` must be preceded by whitespace to start a comment
+        if (c == '#' and !in_single and !in_double) {
+            if (i > 0 and (value[i - 1] == ' ' or value[i - 1] == '\t')) {
+                return value[0..i];
+            }
+        }
+    }
+    return value;
+}
+
+/// Extract a boolean field from YAML-subset frontmatter.
+/// Recognizes `true`, `false`, `yes`, `no` (case-insensitive).
+fn parseFrontmatterBoolField(meta: []const u8, key: []const u8) ?bool {
+    const raw = parseFrontmatterField(meta, key) orelse return null;
+    const val = std.mem.trim(u8, raw, " \t");
+    if (val.len == 0) return null;
+
+    if (std.ascii.eqlIgnoreCase(val, "true") or std.ascii.eqlIgnoreCase(val, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(val, "false") or std.ascii.eqlIgnoreCase(val, "no")) return false;
+    return null;
+}
+
+/// Parse a YAML string array field from frontmatter.
+/// Supports two formats:
+///   Block sequence:  `key:\n  - item1\n  - item2`
+///   Flow sequence:   `key: [item1, item2]`
+/// Caller owns the returned outer slice and each inner slice.
+fn parseFrontmatterStringArray(allocator: std.mem.Allocator, meta: []const u8, key: []const u8) ![]const []const u8 {
+    // First find the line with the key
+    var lines = std.mem.splitScalar(u8, meta, '\n');
+    var found_key = false;
+    var key_value: []const u8 = "";
+
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, "\r \t");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const candidate_key = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+        key_value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        found_key = true;
+        break;
+    }
+
+    if (!found_key) return &.{};
+
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+
+    // Flow sequence: [item1, item2]
+    if (key_value.len > 0 and key_value[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, key_value, ']') orelse return &.{};
+        const inner = key_value[1..close];
+
+        var parts = std.mem.splitScalar(u8, inner, ',');
+        while (parts.next()) |part_raw| {
+            const part = std.mem.trim(u8, stripFrontmatterInlineComment(part_raw), " \t");
+            if (part.len == 0) continue;
+
+            // Strip quotes if present
+            const val = stripYamlQuotes(part);
+            if (val.len == 0) continue;
+            try items.append(allocator, try allocator.dupe(u8, val));
+        }
+        return try items.toOwnedSlice(allocator);
+    }
+
+    // Block sequence: subsequent lines starting with "  - "
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, "\r");
+        if (line.len == 0) continue;
+
+        // Check if line is indented and starts with "- "
+        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        if (trimmed.len > 0 and trimmed[0] == '#') continue;
+        if (trimmed.len < 2 or trimmed[0] != '-') break; // end of block sequence
+        if (trimmed[1] != ' ' and trimmed[1] != '\t') break;
+
+        const val_raw = std.mem.trim(u8, stripFrontmatterInlineComment(trimmed[2..]), " \t");
+        const val = stripYamlQuotes(val_raw);
+        if (val.len == 0) continue;
+        try items.append(allocator, try allocator.dupe(u8, val));
+    }
+
+    return try items.toOwnedSlice(allocator);
+}
+
+/// Strip surrounding quotes (single or double) from a YAML value.
+fn stripYamlQuotes(val: []const u8) []const u8 {
+    if (val.len < 2) return val;
+    const q = val[0];
+    if ((q == '"' or q == '\'') and val[val.len - 1] == q) {
+        return val[1 .. val.len - 1];
+    }
+    return val;
+}
+
+/// Read a SKILL.md file and parse it (with optional YAML frontmatter) into a fully-owned Skill.
+/// All string fields are heap-allocated via `allocator`; caller must free with `freeSkill`.
+/// When no frontmatter name is found, the directory basename of `skill_dir_path` is used.
+/// Returns `error.ManifestNotFound` if the SKILL.md file does not exist.
+fn parseFrontmatterSkill(
+    allocator: std.mem.Allocator,
+    skill_dir_path: []const u8,
+) !Skill {
+    const instructions_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{skill_dir_path});
+    defer allocator.free(instructions_path);
+
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
+        return error.ManifestNotFound;
+    defer allocator.free(content);
+
+    const split = splitFrontmatter(content);
+    const meta = if (split) |s| s.meta else "";
+    const body = if (split) |s| s.body else content;
+
+    const fm_name = parseFrontmatterField(meta, "name") orelse "";
+    const dirname = std.fs.path.basename(skill_dir_path);
+    const skill_name = if (fm_name.len > 0) fm_name else dirname;
+    try validateSkillName(skill_name);
+
+    const always = parseFrontmatterBoolField(meta, "always") orelse false;
+
+    const requires_bins = parseFrontmatterStringArray(allocator, meta, "requires_bins") catch &.{};
+    errdefer if (requires_bins.len > 0) freeStringArray(allocator, requires_bins);
+    const requires_env = parseFrontmatterStringArray(allocator, meta, "requires_env") catch &.{};
+    errdefer if (requires_env.len > 0) freeStringArray(allocator, requires_env);
+
+    const name = try allocator.dupe(u8, skill_name);
+    errdefer allocator.free(name);
+    const version = try allocator.dupe(u8, parseFrontmatterField(meta, "version") orelse "0.0.1");
+    errdefer allocator.free(version);
+    const description = try allocator.dupe(u8, parseFrontmatterField(meta, "description") orelse "");
+    errdefer allocator.free(description);
+    const author = try allocator.dupe(u8, parseFrontmatterField(meta, "author") orelse "");
+    errdefer allocator.free(author);
+    const path = try allocator.dupe(u8, skill_dir_path);
+    errdefer allocator.free(path);
+    const instructions = try allocator.dupe(u8, body);
+    errdefer allocator.free(instructions);
+
+    return Skill{
+        .name = name,
+        .version = version,
+        .description = description,
+        .author = author,
+        .instructions = instructions,
+        .enabled = true,
+        .always = always,
+        .requires_bins = requires_bins,
+        .requires_env = requires_env,
+        .path = path,
+    };
+}
+
 // ── Skill Loading ───────────────────────────────────────────────
 
 /// Load a single skill from a directory.
@@ -332,36 +610,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         };
     }
 
-    const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
-        return error.ManifestNotFound;
-    errdefer allocator.free(instructions);
-
-    const dirname = std.fs.path.basename(skill_dir_path);
-    try validateSkillName(dirname);
-
-    const name = try allocator.dupe(u8, dirname);
-    errdefer allocator.free(name);
-    const version = try allocator.dupe(u8, "0.0.1");
-    errdefer allocator.free(version);
-    const description = try allocator.dupe(u8, "");
-    errdefer allocator.free(description);
-    const author = try allocator.dupe(u8, "");
-    errdefer allocator.free(author);
-    const path = try allocator.dupe(u8, skill_dir_path);
-    errdefer allocator.free(path);
-
-    return Skill{
-        .name = name,
-        .version = version,
-        .description = description,
-        .author = author,
-        .instructions = instructions,
-        .enabled = true,
-        .always = false,
-        .requires_bins = &.{},
-        .requires_env = &.{},
-        .path = path,
-    };
+    return try parseFrontmatterSkill(allocator, skill_dir_path);
 }
 
 /// Free all heap-allocated fields of a Skill.
@@ -3928,4 +4177,455 @@ test "freeSyncResult frees message" {
     };
     // freeSyncResult should not leak — testing allocator will catch leaks
     freeSyncResult(allocator, &result);
+}
+
+// ── Frontmatter Parsing Tests ───────────────────────────────────
+
+test "splitFrontmatter valid block" {
+    const content =
+        \\---
+        \\name: test-skill
+        \\description: A test skill
+        \\---
+        \\
+        \\# Instructions
+        \\Do the thing.
+    ;
+    const result = splitFrontmatter(content) orelse unreachable;
+    try std.testing.expectEqualStrings("name: test-skill\ndescription: A test skill\n", result.meta);
+    try std.testing.expectEqualStrings("\n# Instructions\nDo the thing.", result.body);
+}
+
+test "splitFrontmatter no frontmatter" {
+    const content = "# Just Markdown\nNo frontmatter here.";
+    try std.testing.expect(splitFrontmatter(content) == null);
+}
+
+test "splitFrontmatter unclosed delimiter" {
+    const content = "---\nname: broken\nNo closing delimiter.";
+    try std.testing.expect(splitFrontmatter(content) == null);
+}
+
+test "splitFrontmatter delimiter not at start" {
+    const content = "some text\n---\nname: test\n---\nbody";
+    try std.testing.expect(splitFrontmatter(content) == null);
+}
+
+test "splitFrontmatter empty block" {
+    const content = "---\n---\nbody content";
+    const result = splitFrontmatter(content) orelse unreachable;
+    try std.testing.expectEqualStrings("", result.meta);
+    try std.testing.expectEqualStrings("body content", result.body);
+}
+
+test "splitFrontmatter empty body" {
+    const content = "---\nname: test\n---\n";
+    const result = splitFrontmatter(content) orelse unreachable;
+    try std.testing.expectEqualStrings("name: test\n", result.meta);
+    try std.testing.expectEqualStrings("", result.body);
+}
+
+test "splitFrontmatter only opening dashes no newline" {
+    const content = "---";
+    try std.testing.expect(splitFrontmatter(content) == null);
+}
+
+test "parseFrontmatterField bare value" {
+    const meta = "name: my-skill\nversion: 1.0.0";
+    try std.testing.expectEqualStrings("my-skill", parseFrontmatterField(meta, "name").?);
+    try std.testing.expectEqualStrings("1.0.0", parseFrontmatterField(meta, "version").?);
+}
+
+test "parseFrontmatterField double-quoted value" {
+    const meta = "description: \"A skill with spaces\"";
+    try std.testing.expectEqualStrings("A skill with spaces", parseFrontmatterField(meta, "description").?);
+}
+
+test "parseFrontmatterField single-quoted value" {
+    const meta = "author: 'some-dev'";
+    try std.testing.expectEqualStrings("some-dev", parseFrontmatterField(meta, "author").?);
+}
+
+test "parseFrontmatterField missing key" {
+    const meta = "name: test\nversion: 1.0.0";
+    try std.testing.expect(parseFrontmatterField(meta, "author") == null);
+}
+
+test "parseFrontmatterField with inline comment" {
+    const meta = "name: test-skill # this is the name";
+    try std.testing.expectEqualStrings("test-skill", parseFrontmatterField(meta, "name").?);
+}
+
+test "parseFrontmatterField empty value" {
+    const meta = "description:";
+    try std.testing.expectEqualStrings("", parseFrontmatterField(meta, "description").?);
+}
+
+test "parseFrontmatterField skips comment lines" {
+    const meta = "# a comment\nname: real-name";
+    try std.testing.expectEqualStrings("real-name", parseFrontmatterField(meta, "name").?);
+}
+
+test "parseFrontmatterBoolField true values" {
+    const meta = "always: true";
+    try std.testing.expect(parseFrontmatterBoolField(meta, "always").?);
+
+    const meta2 = "always: yes";
+    try std.testing.expect(parseFrontmatterBoolField(meta2, "always").?);
+
+    const meta3 = "always: True";
+    try std.testing.expect(parseFrontmatterBoolField(meta3, "always").?);
+}
+
+test "parseFrontmatterBoolField false values" {
+    const meta = "always: false";
+    try std.testing.expect(!parseFrontmatterBoolField(meta, "always").?);
+
+    const meta2 = "always: no";
+    try std.testing.expect(!parseFrontmatterBoolField(meta2, "always").?);
+}
+
+test "parseFrontmatterBoolField missing key" {
+    const meta = "name: test";
+    try std.testing.expect(parseFrontmatterBoolField(meta, "always") == null);
+}
+
+test "parseFrontmatterStringArray block sequence" {
+    const allocator = std.testing.allocator;
+    const meta = "requires_bins:\n  - docker\n  - git\n  - kubectl";
+    const arr = try parseFrontmatterStringArray(allocator, meta, "requires_bins");
+    defer freeStringArray(allocator, arr);
+
+    try std.testing.expectEqual(@as(usize, 3), arr.len);
+    try std.testing.expectEqualStrings("docker", arr[0]);
+    try std.testing.expectEqualStrings("git", arr[1]);
+    try std.testing.expectEqualStrings("kubectl", arr[2]);
+}
+
+test "parseFrontmatterStringArray flow sequence" {
+    const allocator = std.testing.allocator;
+    const meta = "requires_env: [API_KEY, SECRET_TOKEN]";
+    const arr = try parseFrontmatterStringArray(allocator, meta, "requires_env");
+    defer freeStringArray(allocator, arr);
+
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("API_KEY", arr[0]);
+    try std.testing.expectEqualStrings("SECRET_TOKEN", arr[1]);
+}
+
+test "parseFrontmatterStringArray flow sequence with quotes" {
+    const allocator = std.testing.allocator;
+    const meta = "requires_bins: [\"docker\", \"git\"]";
+    const arr = try parseFrontmatterStringArray(allocator, meta, "requires_bins");
+    defer freeStringArray(allocator, arr);
+
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("docker", arr[0]);
+    try std.testing.expectEqualStrings("git", arr[1]);
+}
+
+test "parseFrontmatterStringArray missing key" {
+    const allocator = std.testing.allocator;
+    const meta = "name: test";
+    const arr = try parseFrontmatterStringArray(allocator, meta, "requires_bins");
+    try std.testing.expectEqual(@as(usize, 0), arr.len);
+}
+
+test "parseFrontmatterStringArray block sequence with quoted items" {
+    const allocator = std.testing.allocator;
+    const meta = "tags:\n  - 'item-one'\n  - \"item-two\"";
+    const arr = try parseFrontmatterStringArray(allocator, meta, "tags");
+    defer freeStringArray(allocator, arr);
+
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("item-one", arr[0]);
+    try std.testing.expectEqualStrings("item-two", arr[1]);
+}
+
+test "parseFrontmatterStringArray block sequence ignores comments" {
+    const allocator = std.testing.allocator;
+    const meta =
+        \\requires_bins:
+        \\  - docker # primary runtime
+        \\  # keep git for repo access
+        \\  - git
+    ;
+    const arr = try parseFrontmatterStringArray(allocator, meta, "requires_bins");
+    defer freeStringArray(allocator, arr);
+
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("docker", arr[0]);
+    try std.testing.expectEqualStrings("git", arr[1]);
+}
+
+test "parseFrontmatterSkill full frontmatter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("ctx-skill");
+    {
+        const f = try tmp.dir.createFile("ctx-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll(
+            "---\n" ++
+                "name: context7\n" ++
+                "description: Retrieve docs via API\n" ++
+                "version: 1.0.0\n" ++
+                "author: opencode\n" ++
+                "always: true\n" ++
+                "requires_bins:\n" ++
+                "  - curl\n" ++
+                "requires_env: [API_KEY]\n" ++
+                "---\n" ++
+                "\n" ++
+                "# Context7\n" ++
+                "Instructions here.\n",
+        );
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "ctx-skill" });
+    defer allocator.free(skill_dir);
+
+    const skill = try parseFrontmatterSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("context7", skill.name);
+    try std.testing.expectEqualStrings("1.0.0", skill.version);
+    try std.testing.expectEqualStrings("Retrieve docs via API", skill.description);
+    try std.testing.expectEqualStrings("opencode", skill.author);
+    try std.testing.expect(skill.always);
+    try std.testing.expectEqual(@as(usize, 1), skill.requires_bins.len);
+    try std.testing.expectEqualStrings("curl", skill.requires_bins[0]);
+    try std.testing.expectEqual(@as(usize, 1), skill.requires_env.len);
+    try std.testing.expectEqualStrings("API_KEY", skill.requires_env[0]);
+    try std.testing.expectEqualStrings("\n# Context7\nInstructions here.\n", skill.instructions);
+}
+
+test "parseFrontmatterSkill missing name falls back to dirname" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("my-dirname");
+    {
+        const f = try tmp.dir.createFile("my-dirname/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("---\ndescription: A skill\nversion: 2.0.0\n---\nBody.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "my-dirname" });
+    defer allocator.free(skill_dir);
+
+    const skill = try parseFrontmatterSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("my-dirname", skill.name);
+    try std.testing.expectEqualStrings("2.0.0", skill.version);
+    try std.testing.expectEqualStrings("A skill", skill.description);
+    try std.testing.expectEqualStrings("Body.", skill.instructions);
+}
+
+test "parseFrontmatterSkill no frontmatter returns defaults with full content" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("plain-skill");
+    {
+        const f = try tmp.dir.createFile("plain-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Just Markdown\nNo frontmatter.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "plain-skill" });
+    defer allocator.free(skill_dir);
+
+    const skill = try parseFrontmatterSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("plain-skill", skill.name);
+    try std.testing.expectEqualStrings("0.0.1", skill.version);
+    try std.testing.expectEqualStrings("", skill.description);
+    try std.testing.expectEqualStrings("", skill.author);
+    try std.testing.expect(!skill.always);
+    try std.testing.expectEqualStrings("# Just Markdown\nNo frontmatter.", skill.instructions);
+}
+
+test "parseFrontmatterSkill minimal frontmatter" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("min-skill");
+    {
+        const f = try tmp.dir.createFile("min-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("---\nname: minimal\n---\nInstructions.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "min-skill" });
+    defer allocator.free(skill_dir);
+
+    const skill = try parseFrontmatterSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("minimal", skill.name);
+    try std.testing.expectEqualStrings("0.0.1", skill.version);
+    try std.testing.expectEqualStrings("", skill.description);
+    try std.testing.expect(!skill.always);
+    try std.testing.expectEqualStrings("Instructions.", skill.instructions);
+}
+
+test "loadSkill SKILL.md with frontmatter populates manifest" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/fm-skill");
+    {
+        const f = try tmp.dir.createFile("skills/fm-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("---\nname: from-frontmatter\ndescription: Parsed from YAML\nversion: 3.0.0\nauthor: fm-author\nalways: true\n---\n\n# Instructions\nDo the thing.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "fm-skill" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("from-frontmatter", skill.name);
+    try std.testing.expectEqualStrings("3.0.0", skill.version);
+    try std.testing.expectEqualStrings("Parsed from YAML", skill.description);
+    try std.testing.expectEqualStrings("fm-author", skill.author);
+    try std.testing.expect(skill.always);
+    // Instructions should NOT contain the frontmatter block
+    try std.testing.expectEqualStrings("\n# Instructions\nDo the thing.", skill.instructions);
+}
+
+test "loadSkill SKILL.md frontmatter without name falls back to dirname" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/dirname-fallback");
+    {
+        const f = try tmp.dir.createFile("skills/dirname-fallback/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("---\ndescription: Has description but no name\nversion: 1.5.0\n---\nBody text.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "dirname-fallback" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    // Name falls back to directory name
+    try std.testing.expectEqualStrings("dirname-fallback", skill.name);
+    // Other fields come from frontmatter
+    try std.testing.expectEqualStrings("1.5.0", skill.version);
+    try std.testing.expectEqualStrings("Has description but no name", skill.description);
+    try std.testing.expectEqualStrings("Body text.", skill.instructions);
+}
+
+test "loadSkill SKILL.md without frontmatter unchanged behavior" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/no-fm");
+    {
+        const f = try tmp.dir.createFile("skills/no-fm/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Plain Markdown\nNo frontmatter here.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "no-fm" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("no-fm", skill.name);
+    try std.testing.expectEqualStrings("0.0.1", skill.version);
+    try std.testing.expectEqualStrings("", skill.description);
+    try std.testing.expectEqualStrings("# Plain Markdown\nNo frontmatter here.", skill.instructions);
+}
+
+test "loadSkill SKILL.md frontmatter with requires_bins" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/bins-skill");
+    {
+        const f = try tmp.dir.createFile("skills/bins-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("---\nname: bins-skill\nrequires_bins:\n  - docker\n  - git\n---\nInstructions.");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "bins-skill" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("bins-skill", skill.name);
+    try std.testing.expectEqual(@as(usize, 2), skill.requires_bins.len);
+    try std.testing.expectEqualStrings("docker", skill.requires_bins[0]);
+    try std.testing.expectEqualStrings("git", skill.requires_bins[1]);
+    try std.testing.expectEqualStrings("Instructions.", skill.instructions);
+}
+
+test "loadSkill SKILL.md frontmatter requires_bins ignores comments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/commented-bins");
+    {
+        const f = try tmp.dir.createFile("skills/commented-bins/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll(
+            "---\n" ++
+                "name: commented-bins\n" ++
+                "requires_bins:\n" ++
+                "  - docker # primary runtime\n" ++
+                "  # keep git for repo access\n" ++
+                "  - git\n" ++
+                "---\n" ++
+                "Instructions.\n",
+        );
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "commented-bins" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("commented-bins", skill.name);
+    try std.testing.expectEqual(@as(usize, 2), skill.requires_bins.len);
+    try std.testing.expectEqualStrings("docker", skill.requires_bins[0]);
+    try std.testing.expectEqualStrings("git", skill.requires_bins[1]);
 }

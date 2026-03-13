@@ -17,6 +17,7 @@ const daemon = @import("daemon.zig");
 const channels_mod = @import("channels/root.zig");
 const mattermost = channels_mod.mattermost;
 const discord = channels_mod.discord;
+const dingtalk = channels_mod.dingtalk;
 const imessage = channels_mod.imessage;
 const qq = channels_mod.qq;
 const onebot = channels_mod.onebot;
@@ -942,7 +943,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     }
     if (channel_catalog.isBuildEnabled(.dingtalk)) {
         expected_total += config.channels.dingtalk.len;
-        expected_send_only += config.channels.dingtalk.len;
+        expected_gateway_loop += config.channels.dingtalk.len;
     }
 
     try std.testing.expectEqual(expected_total, mgr.count());
@@ -1031,6 +1032,14 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         try std.testing.expect(slack_ptr.policy.group == .allowlist);
         try std.testing.expectEqual(@as(usize, 1), slack_ptr.policy.allowlist.len);
         try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
+    }
+
+    if (channel_catalog.isBuildEnabled(.dingtalk)) {
+        const dingtalk_entry = findEntryByNameAccount(entries, "dingtalk", "ding-main") orelse
+            return error.TestUnexpectedResult;
+        const dingtalk_ptr: *dingtalk.DingTalkChannel = @ptrCast(@alignCast(dingtalk_entry.channel.ptr));
+        try std.testing.expectEqual(ListenerType.gateway_loop, dingtalk_entry.listener_type);
+        try std.testing.expect(dingtalk_ptr.event_bus == &event_bus);
     }
 }
 
