@@ -217,7 +217,8 @@ fn printProviderNextSteps(
 
     if (requires_api_key and !has_configured_key) {
         try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
-        try out.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:           nullclaw gateway\n");
         return;
     }
@@ -225,21 +226,24 @@ fn printProviderNextSteps(
     if (std.mem.eql(u8, canonical, "openai-codex")) {
         try out.writeAll("    1. Authenticate:  nullclaw auth login openai-codex\n");
         try out.writeAll("       Alternative:   nullclaw auth login openai-codex --import-codex\n");
-        try out.writeAll("    2. Chat:          nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:       nullclaw gateway\n");
         return;
     }
 
     if (std.mem.eql(u8, canonical, "codex-cli")) {
         try out.writeAll("    1. Authenticate:  codex login\n");
-        try out.writeAll("    2. Chat:          nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:       nullclaw gateway\n");
         return;
     }
 
-    try out.writeAll("    1. Chat:     nullclaw agent -m \"Hello!\"\n");
-    try out.writeAll("    2. Gateway:  nullclaw gateway\n");
-    try out.writeAll("    3. Status:   nullclaw status\n");
+    try out.writeAll("    1. Interactive chat:  nullclaw agent\n");
+    try out.writeAll("       Then type:         Hello!\n");
+    try out.writeAll("    2. Gateway:           nullclaw gateway\n");
+    try out.writeAll("    3. Status:            nullclaw status\n");
 }
 
 /// Resolve a provider name used in quick setup.
@@ -280,6 +284,22 @@ pub fn defaultModelForProvider(provider: []const u8) []const u8 {
     const canonical = canonicalProviderName(provider);
     if (findProviderInfoByCanonical(canonical)) |p| return p.default_model;
     return "anthropic/claude-sonnet-4.6";
+}
+
+fn writeOnboardingNextSteps(out: anytype, api_key_env_hint: ?[]const u8) !void {
+    try out.writeAll("\n  Next steps:\n");
+    if (api_key_env_hint) |env_hint| {
+        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
+        try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
+        try out.writeAll("    3. Gateway:           nullclaw gateway\n");
+    } else {
+        try out.writeAll("    1. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
+        try out.writeAll("    2. Gateway:           nullclaw gateway\n");
+        try out.writeAll("    3. Status:            nullclaw status\n");
+    }
+    try out.writeAll("\n");
 }
 
 /// Get the environment variable name for a provider's API key.
@@ -3092,6 +3112,57 @@ test "defaultModelForProvider groq" {
 
 test "defaultModelForProvider openrouter" {
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", defaultModelForProvider("openrouter"));
+}
+
+test "printProviderNextSteps prefers interactive chat when api key is already set" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, true);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Then type:         Hello!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Status:            nullclaw status") != null);
+}
+
+test "printProviderNextSteps includes env hint before interactive chat" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "openai", "OPENAI_API_KEY", true, false);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "export OPENAI_API_KEY=\"sk-...\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Gateway:           nullclaw gateway") != null);
+}
+
+test "printProviderNextSteps keeps openai-codex auth flow and interactive chat" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "openai-codex", "", false, false);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw auth login openai-codex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "--import-codex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+}
+
+test "printProviderNextSteps keeps codex-cli auth flow and interactive chat" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "codex-cli", "OPENAI_API_KEY", false, false);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "codex login") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
 test "providerEnvVar gemini aliases" {
